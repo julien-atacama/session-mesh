@@ -205,6 +205,7 @@
       </div>
       <span class="p-cwd mute"></span>
       <div class="p-actions">
+        <button type="button" class="btn ghost sm p-native-mic" data-act="dictate" data-i18n-aria-label="dictation.holdLabel" data-i18n-title="dictation.holdHint" aria-pressed="false" aria-disabled="true">🎙</button>
         <details class="p-provenance"><summary aria-label="Pane identity" data-i18n-aria-label="pane.identity" data-i18n="pane.info">Info</summary><div class="p-provenance-body"></div></details>
         <button type="button" class="btn ghost sm p-questions" data-act="questions" hidden><span aria-hidden="true">?</span><span class="p-questions-count" aria-hidden="true"></span></button>
         <button type="button" class="btn ghost sm p-primary" data-act="compose" title="Mailbox: messages between agents for this session" aria-label="Open the mailbox of this session" data-i18n-title="pane.mailboxTitle" data-i18n-aria-label="pane.mailboxAria"><span data-i18n="pane.mailbox">Mailbox</span><span class="mail-badge" hidden><span class="mail-badge-count" aria-hidden="true"></span><span class="sr-only" role="status"></span></span></button>
@@ -220,6 +221,7 @@
       <button type="button" class="btn ghost sm p-input-discard" data-i18n="conn.inputDiscard">Discard input</button>
       <div class="p-input-drafts"></div>
     </div>
+    <p class="p-inline-dictation-status" role="status" aria-live="polite" aria-atomic="true" hidden></p>
     <div class="pane-body">
       <div class="demo-tools" hidden>
         <label class="demo-switch"><span data-i18n="demo.label">Demo</span><select aria-label="Choose a demo of this session" data-i18n-aria-label="demo.chooseAria"></select></label>

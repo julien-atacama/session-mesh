@@ -200,7 +200,7 @@ export async function harness(run: (page: Page, api: FakeDictationApi, sockets: 
       await setupMedia(page);
       await page.goto(`${base}/#A`);
       await page.evaluate(() => (MeshI18n.ready));
-      if (!pending) await page.waitForFunction(() => active?.conn?.terminal?.isOpen()
+      if (!pending) await page.waitForFunction(() => active?.conn?.terminal?.isOpen() && dictationInventoryReady
         && !active.conn.replayPending && !active.conn.replaying && !active.conn.draining);
       await run(page, api, sockets, writes);
       assert.deepEqual(errors, [], 'actual application emitted a page error');

@@ -1319,7 +1319,8 @@ when explicitly configured, `language`, without Mesh credentials. Enabled public
 reports `language: null` for auto-detection, or the configured language string. A successful response must have status 200 and
 contain JSON with a `text` string, or `text/plain`. The response body is capped at 64 KiB and the
 normalized transcript at 32 KiB; terminal control characters are rejected. API-key headers, model
-selection and provider-specific parameters are not implemented.
+selection and provider-specific parameters are not implemented. See
+[Voice dictation](features.md#voice-dictation) for the desktop and phone editing flows.
 
 ## Documents opened with mesh-open
 

@@ -46,6 +46,7 @@ const context = vm.createContext({WebSocket: Socket, Uint8Array, TextEncoder, cr
   inputLeaseTab: 'a'.repeat(32), humanInputScopes: new Map(), enc: new TextEncoder(), active: null, inventoryLoaded: true,
   lastListing: {management: {state: 'observed'}},
   lineDirect: null, lineRecovery: null, composeOwner: null, composeRecovery: [],
+  renderInlineDictation: () => {}, cancelInlineCapture: () => {},
   // Exercise legacy raw input; acknowledged input is covered by the browser/native seam.
   find: name => ({id: name, kind: 'mesh', created: 42, pty_capabilities: []}),
   updateKeys: () => {}, flash: () => {}, refresh: () => refresh(),

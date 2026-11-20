@@ -37,7 +37,9 @@ install.
   language to the fixed endpoint the operator selected. A remote endpoint receives that audio
   off-host; HTTPS is required except for loopback HTTP endpoints. Mesh login cookies and
   bearer/session tokens are not forwarded. The returned
-  transcript is untrusted text, not permission to execute it: review it before using it in a terminal.
+  transcript is untrusted text, not permission to execute it: the header microphone inserts it
+  without Enter on desktop and stages it in an editable field on phones. Review it before submitting
+  manually.
   This does not attest that the service transcribed the recording accurately. Endpoint configuration
   and the current API contract are documented under [Whisper dictation](docs/operations.md#whisper-dictation).
 - **GitHub and everyone who can push to the repository**, for a release install. A release is

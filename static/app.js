@@ -28,6 +28,7 @@ function requestLocal(...args) {
   requireLocalMesh();
   if (args[0] === "/api/logout" || args[0] === "/api/logout-all") {
     meshPageFinal = true;
+    inlineDictation?.dispose(); inlineDictationView?.cancel();
   }
   return fetch(...args);
 }
@@ -1557,6 +1558,7 @@ class Pane {
         this.cachedTerminalMoveBlockedId = null;
       }
       this.flushReplayInput(c);
+      renderInlineDictation();
     };
     if (prefix === null) return this.output(bytes, finish);
     // The retained socket observer sees raw output. A visible replay also has
@@ -2599,6 +2601,7 @@ class Pane {
     observePaneActions(this);
     this.paneMenu.refresh();
     this.group?.render();
+    renderDictationBadges(this);
   }
 
   // A pane reused for a document retains the preceding Mesh view. This matters
@@ -2959,6 +2962,8 @@ class Pane {
           }
           this.bumpAutoRedraw(c);
           this.bumpInitialFollow(c);
+          const nativeMode = terminal.dictationMode.valid && terminal.dictationMode.value;
+          if (c.inlineMode !== nativeMode) {c.inlineMode = nativeMode; renderInlineDictation();}
         },
         closed: async (terminal) => {
           clearTimeout(c.v2AwaitTimer);
@@ -3050,6 +3055,7 @@ class Pane {
     // reported to the previous one) and gets a focus-in only per the rules above.
     if (this.focusReported === true) this.reportFocus(false);
     this.focusReported = null; this.heldFocusIn = false;
+    cancelInlineCapture(this);
     this.cancelReplayInput(this.conn);
     this.dropReaderAnchor(this.conn);
     this.conn.closed = true;
@@ -3876,6 +3882,7 @@ function setActive(p, persist = false) {
   updateKeys();
   syncMobileRawScrollAction();
   renderLists();
+  renderInlineDictation();
 }
 
 // the phone key bar follows the active pane: shown while it holds a terminal
@@ -3926,6 +3933,7 @@ class WorkspaceGroup {
   }
   select(p, activate = true) {
     if (!this.tabs.includes(p)) return;
+    for (const q of this.tabs) if (q !== p) cancelInlineCapture(q);
     this.selected = p;
     for (const q of this.tabs) q.el.classList.toggle("tab-hidden", q !== p);
     this.render();
@@ -4538,10 +4546,14 @@ function itemHtml(s, opts = {}) {
   const changed = s.kind === "mesh" && boardModified.has(s.id);
   // what needs me shows what the agent said or asks; otherwise the last prompt
   const preview = mine ? a.said || a.last : a?.last;
+  const nativeVoice = s.kind === "mesh" && inlineDictation?.peekSession(s.name, s.created);
+  const voice = nativeVoice;
+  const voiceLabel = voice ? inlineStateLabel(voice) : "";
+  const voiceBadge = voice?.outstanding ? `<span class="dictation-label" data-state="${esc(voice.state)}">${esc(voiceLabel)}</span>` : "";
   const rowBadge = rowSt === "ready" ? "" : `<span class="row-state ${rowSt}">${esc(t(`sessions.row.${rowSt}`))}</span>`;
   const row = `<button class="item ${here ? "sel" : shown ? "shown" : ""}${s.folder ? " in-folder" : ""}${mine ? ` ${st}` : ""}${rowSt === "ready" ? "" : ` row-${rowSt}`}" data-id="${esc(s.id)}"${opts.todo ? "" : drag}>
     <div class="top"><span class="dot ${rowSt === "ready" ? st : "pending"}" aria-hidden="true"></span><span class="name">${esc(label(s))}</span>${accountBadgeHtml(s)}${changed ? `<span class="board-badge" aria-label="${esc(t("list.boardModified"))}" title="${esc(t("list.boardModified"))}"></span>` : ""}${s.pending ? `<span class="tag" title="${esc(t("list.pendingRestart"))}">⏳</span>` : ""}${s.wake_unconfirmed === true ? `<span class="tag wake-unconfirmed" role="img" aria-label="${esc(t("list.wakeUnconfirmed"))}" title="${esc(t("list.wakeUnconfirmed"))}">✉?</span>` : ""}${questionBadgeHtml(s)}${tag}<span class="ago">${esc(ago(lastSeen(s)))}</span></div>
-    <div class="meta">${rowBadge}${stText}${esc(where)}</div>
+    <div class="meta">${rowBadge}${stText}${esc(where)} ${voiceBadge}</div>
     ${s.notice === "opencode-unsupported" ? `<div class="last">${esc(t("list.opencodeUnsupportedNotice"))}</div>` : ""}
     ${s.notice === "opencode-unreadable" ? `<div class="last">${esc(t("list.opencodeUnreadableNotice"))}</div>` : ""}
     ${preview ? `<div class="last">${esc(preview)}</div>` : ""}
@@ -5445,6 +5457,7 @@ function reloadHolds() {
     if (pane.recoveredComposeDraft?.text) add("input-draft", t("reload.hold.inputDraft"), pane.recoveredComposeDraft);
     if (pane.recoveredLineDrafts?.size) add("input-draft", t("reload.hold.inputDraft"), pane.recoveredLineDrafts);
   }
+  for (const session of inlineDictation?.holds() || []) add("dictation", t("dictation.reloadHold", {session: session.name}), session);
   if (fieldHoldsText()) add("draft", t("reload.hold.draft"));
   if (linePending) add("line-pending", t("reload.hold.linePending"), linePending);
   if (lineRecovery) add("line-recovery", t("reload.hold.lineRecovery"), lineRecovery);
@@ -5905,6 +5918,7 @@ async function loadLocalInventory(signal, attempt) {
   if (!current()) return { kind: "failed", status: null };
   if (response.status === 401) {
     forgetKnownSessions();
+    inlineDictation?.dispose(); inlineDictationView?.cancel();
     location.href = "/login";
     return { kind: "refused" };
   }
@@ -5996,19 +6010,22 @@ function startInventory(context, cacheResume = false) {
             else signal.addEventListener("abort", aborted, {once: true});
           }),
         ]);
+        if (current() && !signal.aborted && outcome?.kind !== "loaded") reportDictationInventory(issue, false);
         return outcome;
       } catch (error) {
+        if (current() && !signal.aborted) reportDictationInventory(issue, false);
         throw error;
       } finally {if (aborted) signal.removeEventListener("abort", aborted);}
     },
     apply: (value) => {
       if (!current()) return undefined;
       if (Progress.holdKnownRows(value, data)) {
-        lastListing = value; sessionsStatus.render(); return undefined;
+        lastListing = value; reportDictationInventory(issue, false); sessionsStatus.render(); return undefined;
       }
       const snapshot = validateInventorySnapshot(value);
-      if (!snapshot) {return undefined;}
+      if (!snapshot) {reportDictationInventory(issue, false); return undefined;}
       const applied = applyInventorySnapshot(issue, snapshot);
+      reportDictationInventory(issue, !!applied && snapshot.identities !== null);
       return applied;
     },
     clock: { now: () => Date.now(), setTimeout: (run, ms) => setTimeout(run, ms), clearTimeout: (handle) => clearTimeout(handle) },
@@ -6019,11 +6036,13 @@ function startInventory(context, cacheResume = false) {
       shortRecoveryDeadline = false;
       return timeout;
     },
-    onChange: () => {
+    onChange: (state) => {
       if (!current() || state.stopped) return;
+      if (state.lastFailureKind === "timeout") reportDictationInventory(issue, false);
       sessionsStatus.render();
     },
     onApplyError: (error) => {
+      if (current()) reportDictationInventory(issue, false);
       console.error("session-mesh: the session list could not be applied", error);
     },
   });
@@ -7735,7 +7754,7 @@ lineStatus.setAttribute("aria-live", "polite");
 lineStatus.hidden = true;
 lineStatus.style.cssText = "padding:6px 10px;overflow-wrap:anywhere;background:var(--panel);border-top:1px solid var(--line)";
 $("#line").after(lineStatus);
-let linePending = null, lineRecovery = null;
+let linePending = null, lineRecovery = null, lineRevision = 0, lineDictationOrigin = null;
 function saveRecoveredLine() {
   const target = recoveredLineTarget;
   if (!target) return;
@@ -7798,6 +7817,7 @@ function renderLineStatus() {
       releaseDiscardedEditorDraft(record.recovered);
       if (line.value === record.text) {
         line.value = "";
+        lineDictationOrigin = null;
         if (recoveredLineTarget === record.recovered) {
           recoveredLineTarget = null;
         }
@@ -7981,6 +8001,7 @@ function flushDirectField(inputType, held = false) {
 // The field changed and no composition is in progress. True when direct writing took the text.
 // `composedOn` is the pane a composition started on: its word does not start the mode on another.
 function settleLine(inputType, composedOn = active) {
+  if (lineDictationOrigin) return false;   // dictated corrections stay local, including slash/skill prefixes
   if (lineDirect) {
     if (!directLineAlive()) return false;
     flushDirectField(inputType);
@@ -8088,6 +8109,13 @@ async function sendLine() {
       recoveredLineTarget.name !== pane.conn.name || recoveredLineTarget.created !== pane.conn.created)) {
     flash(t("line.recoveredOtherSession")); return;
   }
+  if (lineDictationOrigin) {
+    const origin = lineDictationOrigin, identity = find(pane.id);
+    if (pane !== origin.pane || pane.conn !== origin.connection || pane.conn.terminal !== origin.terminal
+        || identity?.name !== origin.name || identity?.created !== origin.created) {
+      flash(t("line.dictationTargetChanged")); return;
+    }
+  }
   if (residueHolds(pane)) return;   // once: the next Enter sends
   const text = line.value;
   const recovered = recoveredLineTarget;
@@ -8105,7 +8133,7 @@ async function sendLine() {
     paneTargets.release(target);
     if (linePending === pending) linePending = null;
     if (result.kind === "submitted") {
-      if (line.value === text) line.value = "";
+      if (line.value === text) {line.value = ""; lineDictationOrigin = null;}
       recoveredLineTarget = null;
       fitLine();
     } else {
@@ -8145,6 +8173,9 @@ line.addEventListener("beforeinput", (e) => {   // Enter and Backspace from keyb
   }
 });
 line.addEventListener("input", (e) => {
+  lineRevision++;
+  if (!line.value) lineDictationOrigin = null;
+  if (lineDictationOrigin) {fitLine(); return;}
   if (!e.isComposing && settleLine(e.inputType || "")) { fitLine(); return; }
   if (ctrlArmed && line.value.length === 1) {   // Ctrl armed in the key bar: the letter is a control key
     const c = line.value.toUpperCase().charCodeAt(0);
@@ -8158,11 +8189,14 @@ line.addEventListener("input", (e) => {
 // The field is checked when a composition starts: its own events come with isComposing set, so
 // beforeinput cannot tell whether the field was empty before the composition.
 line.addEventListener("compositionstart", () => {
+  lineRevision++;
   lineComposing = true;
   lineWasEmpty = line.value === "";
   lineCompositionPane = active;
 });
 line.addEventListener("compositionend", () => {
+  lineRevision++;
+  if (!line.value) lineDictationOrigin = null;
   lineComposing = false;
   const composedOn = lineCompositionPane;
   const before = directFieldAttempt;
@@ -8183,6 +8217,214 @@ composePending.hidden = true;
 ctext.after(composePending);
 let composeOwner = null;
 const composeRecovery = [], composeUploads = [];
+let inlineDictation = null, inlineDictationView = null;
+const inlineContexts = new WeakMap();
+let dictationInventoryReady = false, dictationInventoryIssue = 0;
+function createDictationEncoder() {
+  const host = document.createElement("div");
+  host.setAttribute("aria-hidden", "true"); host.inert = true;
+  host.className = "dictation-encoder";
+  let terminal, disposed = false;
+  try {
+    document.body.append(host);
+    terminal = new Terminal({cols: 80, rows: 2, scrollback: 0});
+    terminal.open(host);
+  } catch (error) {
+    try {terminal?.dispose();} finally {host.remove();}
+    throw error;
+  }
+  return {write: (text, done) => terminal.write(text, done), paste: (text) => terminal.paste(text),
+    onData: (callback) => terminal.onData(callback), dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      try {terminal.dispose();} finally {host.remove();}
+    }};
+}
+function reportDictationInventory(issue, ready) {
+  if (!localMeshEffectsAllowed() || issue < dictationInventoryIssue) return;
+  dictationInventoryIssue = issue; dictationInventoryReady = ready;
+  renderInlineDictation();
+}
+function inlinePhoneBusy() {
+  return touch && (line.value.length > 0 || lineComposing || !!linePending || !!lineRecovery);
+}
+function inlineContextReason(context, capture = false) {
+  const {pane, connection, name, created, lease} = context;
+  const identity = paneTargets.identity(name), session = find(name), terminal = connection?.terminal;
+  if (!localMeshEffectsAllowed() || !dictationInventoryReady || identity?.name !== name
+       || identity.created !== created || session?.created !== created || !rowAuthoritative(session)) return "unavailable";
+  if (!MeshPaneActions.foregroundAgent(session)) return "unsupportedTarget";
+  if (session.agent?.status === "busy") return "agentBusy";
+  if (session.agent?.status !== "idle") return "agentNotReady";
+  if (!terminal?.isOpen() || !terminal.isBound(name, created) || connection.ended) return "bindingUnavailable";
+  if (connection.replaying || connection.draining || connection.replayPending
+      || !terminal.dictationMode.valid || !terminal.dictationMode.value) return "unsafePaste";
+  if (!lease?.canInsert()) return "pendingInput";
+  if (touch && (lease.inputDirty || lineDirect || ctrlArmed)) return "phoneNativeInputBusy";
+  if (capture && (pane.actionDisposed || pane.conn !== connection || pane.el.classList.contains("tab-hidden")
+      || pane.el.getClientRects().length === 0)) return "hiddenContext";
+  if (capture && inlinePhoneBusy()) return "phoneInputBusy";
+  return "";
+}
+function inlineContext(pane) {
+  const c = pane.conn;
+  return {pane, connection: c, name: c?.name, created: c?.created, lease: pane.inputLease};
+}
+function inlineSessionEligible(session) {
+  const context = inlineContexts.get(session);
+  return !!context && !inlineContextReason(context, ["idle", "requesting", "recording"].includes(session.state));
+}
+function resolveInlineHold(button) {
+  const pane = panes.find(p => p.el.contains(button)), c = pane?.conn;
+  if (!inlineDictation || !pane || !Number.isFinite(c?.created) || c.created <= 0) return null;
+  const session = inlineDictation.session(c.name, c.created);
+  setActive(pane);
+  renderInlineDictation();
+  if (!session.outstanding || ["idle", "recovery"].includes(session.state)) inlineContexts.set(session, inlineContext(pane));
+  return {controller: inlineDictation, session};
+}
+function retainInlinePhonePrompt(context, releaseTarget) {
+  const {pane, connection, lease} = context;
+  const fieldRevision = lineRevision, nativeRevision = lease.revision, releaseLease = lease.retain();
+  let released = false, claimed = false, used = false;
+  const valid = () => !released && active === pane && pane.conn === connection
+    && !pane.actionDisposed && !$("#line").hidden && !document.querySelector("dialog[open]")
+    && lineRevision === fieldRevision && lease.revision === nativeRevision
+    && !inlinePhoneBusy() && !inlineContextReason(context, true);
+  return {
+    valid, captureFresh: valid,
+    claim() {if (used || !valid()) return false; claimed = true; return true;},
+    release() {
+      if (released) return;
+      released = true;
+      for (const dispose of [releaseTarget, releaseLease]) {
+        try {dispose();} catch { /* One failed disposer must not retain the other reference. */ }
+      }
+    },
+    deliver(text, done, guard) {
+      if (!claimed || used || !valid() || !guard()) {done({kind: "refused"}); return;}
+      used = true;
+      // Do not dispatch input: a dictated slash/skill must remain an editable draft too.
+      lineDictationOrigin = {...context, terminal: connection.terminal};
+      line.value = text; lineWasEmpty = false; lineRevision++; fitLine();
+      done({kind: "draft"});
+    },
+  };
+}
+function retainInlineChannel(session) {
+  const context = inlineContexts.get(session);
+  if (!context || inlineContextReason(context, true)) return null;
+  const {pane, connection, lease} = context, terminal = connection.terminal;
+  const target = paneTargets.capture(pane);
+  if (!target) return null;
+  let releaseTerminal = null, released = false;
+  const releaseTarget = () => {
+    if (released) return;
+    released = true;
+    try {paneTargets.release(target);} finally {releaseTerminal?.();}
+  };
+  try {
+    releaseTerminal = terminal.retain();
+    if (!releaseTerminal) {releaseTarget(); return null;}
+    if (touch) return retainInlinePhonePrompt(context, releaseTarget);
+    return MeshPaneActions.createDictationChannel({
+      target, socket: connection.ws, lease, encoder: createDictationEncoder, mode: terminal.dictationMode,
+      insertionOnly: true,
+      valid: () => !inlineContextReason(context),
+      release: releaseTarget,
+      transport: {control: (id, dirty) => terminal.lease(id, dirty), data: bytes => terminal.queueInput(bytes)},
+    });
+  } catch (error) {releaseTarget(); throw error;}
+}
+function inlineInsertionFinished(session) {
+  const context = inlineContexts.get(session), pane = context?.pane;
+  if (!context || !pane || active !== pane || pane.conn !== context.connection
+      || pane.actionDisposed || inlineContextReason(context) || document.querySelector("dialog[open]")) return;
+  const focused = document.activeElement;
+  if (focused !== document.body && !pane.el.contains(focused) && focused !== line) return;
+  if (touch) {
+    if (lineComposing || linePending || lineRecovery) return;
+    line.focus({preventScroll: true});
+  } else pane.term.textarea?.focus({preventScroll: true});
+}
+function cancelInlineCapture(pane) {
+  const c = pane.conn, session = c && inlineDictation?.peekSession(c.name, c.created);
+  const context = session && inlineContexts.get(session);
+  if (!context || context.pane !== pane || context.connection !== c) return;
+  inlineDictationView?.cancel(session); inlineDictation.detach(session);
+}
+function startInlineDictation() {
+  inlineDictation = MeshPaneActions.createInlineDictationController({
+    namespace: `${location.origin}/${meshContext.storagePrefix}/native`, uuid: () => crypto.randomUUID(),
+    allowed: localMeshEffectsAllowed, eligible: inlineSessionEligible, retain: retainInlineChannel,
+    media: MeshPaneActions.browserDictationMedia(), request: (path, init) => requestLocal(path, init),
+    changed: () => {renderInlineDictation(); renderLists(); renderReloadStatus();},
+    inserted: inlineInsertionFinished,
+    schedule: (callback, ms) => setTimeout(callback, ms), unschedule: id => clearTimeout(id), now: () => performance.now(),
+  });
+  inlineDictationView = MeshPaneActions.createInlineDictationView({resolve: resolveInlineHold});
+  for (const event of ["input", "compositionstart", "compositionend"]) line.addEventListener(event, renderInlineDictation);
+  void inlineDictation.start();
+}
+function inlineReasonText(code) {
+  const keys = {
+    unsupportedTarget: "dictation.inline.unsupportedTarget", agentBusy: "dictation.inline.agentBusy",
+    agentNotReady: "dictation.inline.agentNotReady",
+    bindingUnavailable: "dictation.inline.bindingUnavailable", unsafePaste: "dictation.inline.unsafePaste",
+    pendingInput: "dictation.inline.pendingInput", hiddenContext: "dictation.inline.hiddenContext",
+    phoneInputBusy: "dictation.inline.phoneInputBusy", cleanupUnavailable: "dictation.inline.cleanupUnavailable",
+    phoneNativeInputBusy: "dictation.inline.phoneNativeInputBusy",
+    contextChanged: "dictation.inline.interference", deliveryUncertain: "dictation.inline.uncertain",
+    invalidTranscript: "dictation.inline.invalidTranscript", resultExpired: "dictation.inline.expired",
+    jobMissing: "dictation.inline.expired", outstanding: "dictation.inline.outstanding",
+    unavailable: "dictation.message.unavailable", unsupported: "dictation.message.unsupported",
+    microphoneBusy: "dictation.message.microphoneBusy", permissionTimeout: "dictation.message.permissionTimeout",
+    permissionDenied: "dictation.message.permissionDenied", audioLimit: "dictation.message.audioLimit",
+    recordingError: "dictation.message.recordingError", microphoneInterrupted: "dictation.message.microphoneInterrupted",
+    durationLimit: "dictation.message.durationLimit", invalidAudio: "dictation.message.invalidAudio",
+  };
+  return code ? t(keys[code] || "dictation.inline.failure") : "";
+}
+function inlineStateLabel(session) {
+  const keys = {requesting: "dictation.state.requesting", recording: "dictation.state.recording",
+    uploading: "dictation.state.uploading", queued: "dictation.state.queued", processing: "dictation.state.processing",
+    delivering: "dictation.inline.inserting", recovery: "dictation.inline.cleanup"};
+  return session?.message ? inlineReasonText(session.message) : keys[session?.state] ? t(keys[session.state]) : "";
+}
+function renderInlineDictation(onlyPane = null) {
+  const holds = new Set(inlineDictation?.holds() || []);
+  for (const pane of onlyPane?.el ? [onlyPane] : panes) {
+    const button = pane.el.querySelector('[data-act="dictate"]'), status = pane.el.querySelector(".p-inline-dictation-status");
+    if (!button || !status) continue;
+    const c = pane.conn, local = find(pane.id)?.kind === "mesh" && !!c;
+    button.hidden = status.hidden = !local;
+    if (!local) continue;
+    const session = Number.isFinite(c.created) && c.created > 0 ? inlineDictation?.session(c.name, c.created) : null;
+    if (session && !holds.has(session)) inlineContexts.set(session, inlineContext(pane));
+    const localReason = inlineContextReason(inlineContext(pane), true);
+    let controllerReason = session ? inlineDictation.reason(session) : "unavailable";
+    if (!localReason && ["idle", "recovery"].includes(session?.state) && controllerReason === "ineligible") controllerReason = "";
+    const reason = localReason || controllerReason;
+    const capturing = session?.state === "requesting" || session?.state === "recording";
+    button.setAttribute("aria-disabled", String(!!reason && !capturing));
+    button.setAttribute("aria-pressed", String(session?.state === "recording")); button.title = inlineReasonText(reason) || t("dictation.holdHint");
+    status.textContent = inlineStateLabel(session) || inlineReasonText(reason)
+      || (touch ? t("dictation.inline.phoneIdle") : t("dictation.inline.idle"));
+    status.dataset.state = session?.state || "idle";
+  }
+}
+function renderDictationBadges(onlyPane = null) {
+  for (const pane of onlyPane ? [onlyPane] : panes) {
+    let badge = pane.el.querySelector(".p-dictation");
+    if (!badge) {badge = document.createElement("span"); badge.className = "p-dictation dictation-label";
+      badge.setAttribute("role", "status"); pane.el.querySelector(".p-name").after(badge);}
+    const s = find(pane.id), native = s?.kind === "mesh" && inlineDictation?.peekSession(s.name, s.created);
+    const session = native;
+    badge.hidden = !session?.outstanding; badge.dataset.state = session?.state || "idle";
+    badge.textContent = session ? inlineStateLabel(session) : "";
+  }
+  renderInlineDictation(onlyPane);
+}
 function renderComposeStatus() {
   composeStatus.replaceChildren();
   const pending = !!composeOwner?.pending;
@@ -9888,6 +10130,7 @@ async function startMesh(context) {
   tree.hidden = store.get("treeHidden", false);
   document.documentElement.style.setProperty("--side", `${store.get("side", 320)}px`);
   initializeLocalInputTab();
+  startInlineDictation();
   sessionRequestTab = sessionRequestTabNonce();
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
   navigator.serviceWorker?.addEventListener("message", handleLocalServiceWorkerMessage);
@@ -9927,6 +10170,7 @@ function retirePageInput(preserveDraft = false) {
     if (draft) pane.recoveredComposeDraft = null;
   }
   endDirectLine();
+  inlineDictationView?.cancel(); inlineDictation?.hidden();
   if (capActive && !capActive.file) resetCapture(capActive);
   linePending?.operation?.cancel();
   for (const record of composeUploads) if (record.inserting) record.operation?.cancel();
@@ -9941,6 +10185,7 @@ function disposeLocalPage() {
   projectsGeneration++; workGeneration++;
   projectsController?.close(); workController?.close();
   retirePageInput();
+  inlineDictation?.dispose(); inlineDictationView?.dispose();
   inventoryPoller?.stop(); listBatch.cancel(); sessionsStatus.dispose(); pageSignals?.dispose();
   navigator.serviceWorker?.removeEventListener("message", handleLocalServiceWorkerMessage);
   for (const pane of panes) {pane.invalidateActionView(); pane.detach();}
@@ -9954,13 +10199,14 @@ function suspendLocalPage() {
   for (const pane of panes) if (pane.conn) bindings.set(pane, {pane, id: pane.id,
     name: pane.conn.name, created: pane.conn.created});
   meshPageCache = {bindings: [...bindings.values()], focus: document.activeElement};
-  meshPageSuspended = true; meshPageEpoch++;
+  meshPageSuspended = true; meshPageEpoch++; dictationInventoryReady = false;
   disposeBackendAccountSettings();
   flowGeneration++; flowController?.close();
   projectsGeneration++; workGeneration++;
   projectsController?.close(); workController?.close();
   inventoryPoller?.stop(); listBatch.cancel(); pageSignals?.dispose();
   retirePageInput(true);
+  inlineDictation?.suspendForPageCache();
   for (const pane of panes) {
     pane.invalidateActionView(); pane.detach();
     const binding = bindings.get(pane);
@@ -9981,6 +10227,7 @@ async function resumeLocalPage() {
   meshPageSuspended = false;
   void startBackendAccountSettings();
   renderComposeStatus(); listBatch.request();
+  inlineDictation?.resumeFromPageCache(); renderInlineDictation();
   await startInventory(context, true);
   if (!localMeshEffectsAllowed() || meshPageFinal || meshContext !== context || epoch !== meshPageEpoch) return;
   if (projecting) openProjectsPresentation();

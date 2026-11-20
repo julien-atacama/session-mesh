@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Atacama <contact@atacama.tech>
 
-export {createRetainedLifetime} from './dictation.ts';
+export {createRetainedLifetime, browserDictationMedia} from './dictation.ts';
+export {createInlineDictationController} from './dictation-inline.ts';
+export {createInlineDictationView} from './dictation-inline-view.ts';
+export {createDictationChannel} from './dictation-channel.ts';
 export {createDictationModeObserver} from './terminal-mode.ts';
 export {createTerminalInputOrigin} from './terminal-origin.ts';
 // Pane-local presentation only. The app supplies data and keeps action authority.
