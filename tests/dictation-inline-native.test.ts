@@ -216,3 +216,22 @@ nativeTest('AC-11: native deletion and fresh dictation without Discard', async (
     assert.equal(wire.split('\x1b[201~').length - 1, 3);
   });
 });
+
+nativeTest('native fixture drains pending inventory routes before disposing the request context', async () => {
+  let pending: Promise<void> | undefined, failure: unknown, completed = false;
+  await withNativeEditor(async f => {
+    await f.page.route('**/api/sessions?teardown=1', route => {
+      pending = (async () => {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        const response = await route.fetch();
+        await route.fulfill({response}); completed = true;
+      })().catch(error => {failure = error;});
+      return pending;
+    });
+    await f.page.evaluate(() => {void fetch('/api/sessions?teardown=1').catch(() => {});});
+    await f.wait('inventory route is still active at fixture teardown', () => !!pending);
+    assert.equal(completed, false);
+  });
+  await pending;
+  assert.equal(failure, undefined); assert.equal(completed, true);
+});

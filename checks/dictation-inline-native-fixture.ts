@@ -61,6 +61,7 @@ export async function withNativeEditor(run: (f: NativeFixture) => Promise<void>,
   });
   await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
   let host: ChildProcess | undefined, browser: Browser | undefined;
+  let drainRoutes: (() => Promise<void>) | undefined;
   let where: Awaited<ReturnType<typeof scratchHome>> | undefined;
   let server: Awaited<ReturnType<typeof runServer>> | undefined;
   let socket = '', hostErrors = '';
@@ -120,6 +121,7 @@ export async function withNativeEditor(run: (f: NativeFixture) => Promise<void>,
       document.addEventListener('securitypolicyviolation', event => root.__nativeCspViolation(event.effectiveDirective));
     });
     const page = await context.newPage(); page.setDefaultTimeout(7000); page.setDefaultNavigationTimeout(7000);
+    drainRoutes = () => page.isClosed() ? Promise.resolve() : page.unrouteAll({behavior: 'wait'});
     page.on('pageerror', error => errors.push(error.message));
     // ONLY fixture identity substitution. No names/created/state/attachment or relay bytes are synthesized.
     await page.route('**/api/sessions*', async route => {
@@ -264,6 +266,8 @@ export async function withNativeEditor(run: (f: NativeFixture) => Promise<void>,
     const cleanupErrors: unknown[] = [];
     const clean = async (task: () => Promise<unknown>): Promise<void> => {try {await task();} catch (error) {cleanupErrors.push(error);}};
     // Run all cleanups even if another cleanup fails. Every PID/path belongs to this fixture.
+    // route.fetch must finish before browser closure disposes its request context.
+    await clean(async () => drainRoutes?.());
     await clean(async () => browser?.close());
     for (const response of upstream.pending) response.destroy();
     await clean(async () => {if (server) await stopServer(server.child);});
