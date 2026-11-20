@@ -4,6 +4,7 @@
 import {type CapturedTarget, type HumanInputLease, type HumanInputAttempt, type PasteResult} from './pane-actions.ts';
 import type {DictationChannel} from './dictation.ts';
 import type {DictationMode} from './terminal-mode.ts';
+import {hasDictationControls} from '../shared/dictation-text.ts';
 export {createDictationModeObserver} from './terminal-mode.ts';
 
 interface Encoder {
@@ -64,87 +65,101 @@ export function createDictationChannel(p: OriginalChannelPorts): DictationChanne
 }
 
 function createNativeInsertionChannel(p: OriginalChannelPorts, resources: ChannelResources): DictationChannel {
-  let released = false, used = false;
-  let native: HumanInputAttempt | null = null;
-  let onFrame: ((frame: string) => void) | null = null;
-  const captureRevision = p.lease.revision, encoder = resources.encoder;
-  const valid = (): boolean => {
-    try {return !released && p.mode.valid && p.mode.value && p.valid()
-      && (native ? native.valid() : p.lease.revision === captureRevision && p.lease.canInsert());}
+  return new NativeInsertionChannel(p, resources);
+}
+
+interface InsertionPaste {
+  text: string; done(result: PasteResult): void; guard(): boolean;
+  settled: boolean; attempted: boolean; frames: number; wireBytes: number;
+  expected: string; offset: number; stopped: boolean; failure: PasteResult['reason'];
+}
+
+class NativeInsertionChannel implements DictationChannel {
+  private readonly p: OriginalChannelPorts;
+  private readonly resources: ChannelResources;
+  private readonly captureRevision: number;
+  private released = false; private used = false;
+  private native: HumanInputAttempt | null = null;
+  private onFrame: ((frame: string) => void) | null = null;
+
+  constructor(p: OriginalChannelPorts, resources: ChannelResources) {
+    this.p = p; this.resources = resources; this.captureRevision = p.lease.revision;
+    resources.listen(frame => this.onFrame?.(frame));
+  }
+  valid(): boolean {
+    const p = this.p;
+    try {return !this.released && p.mode.valid && p.mode.value && p.valid()
+      && (this.native ? this.native.valid() : p.lease.revision === this.captureRevision && p.lease.canInsert());}
     catch {return false;}
-  };
-  resources.listen(frame => onFrame?.(frame));
-  return {
-    valid,
-    captureFresh: () => valid() && p.lease.revision === captureRevision,
-    claim() {
-      if (used || !valid()) return false;
-      native ??= p.lease.claimInsertion(captureRevision);
-      return !!native && valid();
-    },
-    release() {
-      if (released) return;
-      released = true; onFrame = null; resources.release();
-    },
-    deliver(text, done, guard) {
-      let settled = false, attempted = false, frames = 0, wireBytes = 0;
-      const finish = (kind: PasteResult['kind'], reason: PasteResult['reason']): void => {
-        if (settled) return;
-        settled = true; onFrame = null;
-        const result: PasteResult = {kind, reason, frames, wireBytes,
-          requestedBytes: new TextEncoder().encode(text).byteLength, unknownAttempt: kind === 'uncertain'};
-        done(result);
-      };
-      if (used) {finish('refused', 'guard'); return;}
-      used = true;
-      // LF/tab are data inside framing; CR must already have been normalized
-      // upstream. Never let ESC or other C0/C1 controls terminate that framing.
-      if (!text || /[\x00-\x08\x0b-\x1f\x7f-\x9f]/u.test(text)) {finish('refused', 'incomplete'); return;}
-      const allowed = (): boolean => {
-        try {return !settled && !!native && valid() && guard();} catch {return false;}
-      };
-      const refuse = (reason: PasteResult['reason']): void => finish(attempted ? 'uncertain' : 'refused', reason);
-      prepareEncoder({encoder, mode: () => p.mode.value, valid: allowed, refused: () => refuse('guard'),
-        ready() {
-          if (!allowed()) {refuse('guard'); return;}
-          // Match the independent xterm encoder's existing newline conversion,
-          // but accept no plaintext fallback, truncated framing or extra action.
-          const expected = '\x1b[200~' + text.replace(/\n/g, '\r') + '\x1b[201~';
-          let offset = 0, stopped = false;
-          let failure: PasteResult['reason'] = null;
-          onFrame = frame => {
-            if (stopped || settled) return;
-            if (!allowed()) {stopped = true; failure = 'guard'; return;}
-            if (!frame || !expected.startsWith(frame, offset)) {stopped = true; failure = 'incomplete'; return;}
-            const bytes = new TextEncoder().encode(frame);
-            const revision = p.lease.revision;
-            try {
-              // A paste never completes native H ownership, even if an encoder
-              // splits a multiline payload into a frame containing only CR.
-              const delivered = native!.write(bytes, false, {
-                control: (id, dirty) => p.transport.control(id, dirty),
-                data(payload) {
-                  // H control can reenter application code. At the actual D
-                  // boundary allow exactly our write's one revision increment.
-                  if (released || !p.mode.valid || !p.mode.value || !p.valid() || !guard()
-                    || !p.lease.canInsert() || p.lease.revision !== revision + 1) {
-                    failure = 'guard'; throw Error('insertion guard revoked');
-                  }
-                  attempted = true; p.transport.data(payload);
-                },
-              });
-              if (!delivered) {stopped = true; failure ??= 'send'; return;}
-            } catch {stopped = true; failure = 'send'; return;}
-            frames++; wireBytes += bytes.byteLength; offset += frame.length;
-          };
-          try {encoder.paste(text);} catch {stopped = true; failure = 'paste';}
-          finally {onFrame = null;}
-          if (stopped) {refuse(failure); return;}
-          if (offset !== expected.length) {refuse('incomplete'); return;}
-          if (!allowed()) {refuse('guard'); return;}
-          finish('paste', null);
+  }
+  captureFresh(): boolean {return this.valid() && this.p.lease.revision === this.captureRevision;}
+  claim(): boolean {
+    if (this.used || !this.valid()) return false;
+    this.native ??= this.p.lease.claimInsertion(this.captureRevision);
+    return !!this.native && this.valid();
+  }
+  release(): void {
+    if (this.released) return;
+    this.released = true; this.onFrame = null; this.resources.release();
+  }
+  deliver(text: string, done: (result: PasteResult) => void, guard: () => boolean): void {
+    const paste: InsertionPaste = {text, done, guard, settled: false, attempted: false, frames: 0, wireBytes: 0,
+      expected: '\x1b[200~' + text.replace(/\n/g, '\r') + '\x1b[201~', offset: 0, stopped: false, failure: null};
+    if (this.used) {this.finish(paste, 'refused', 'guard'); return;}
+    this.used = true;
+    // LF/tab are data inside framing; CR must already have been normalized
+    // upstream. Never let ESC or other C0/C1 controls terminate that framing.
+    if (!text || hasDictationControls(text)) {this.finish(paste, 'refused', 'incomplete'); return;}
+    prepareEncoder({encoder: this.resources.encoder, mode: () => this.p.mode.value,
+      valid: () => this.allowed(paste), refused: () => this.refuse(paste, 'guard'), ready: () => this.paste(paste)});
+  }
+  private allowed(paste: InsertionPaste): boolean {
+    try {return !paste.settled && !!this.native && this.valid() && paste.guard();} catch {return false;}
+  }
+  private finish(paste: InsertionPaste, kind: PasteResult['kind'], reason: PasteResult['reason']): void {
+    if (paste.settled) return;
+    paste.settled = true; this.onFrame = null;
+    paste.done({kind, reason, frames: paste.frames, wireBytes: paste.wireBytes,
+      requestedBytes: new TextEncoder().encode(paste.text).byteLength, unknownAttempt: kind === 'uncertain'});
+  }
+  private refuse(paste: InsertionPaste, reason: PasteResult['reason']): void {
+    this.finish(paste, paste.attempted ? 'uncertain' : 'refused', reason);
+  }
+  private paste(paste: InsertionPaste): void {
+    if (!this.allowed(paste)) {this.refuse(paste, 'guard'); return;}
+    // Match xterm's newline conversion, but accept no plaintext fallback,
+    // truncated framing or extra action.
+    this.onFrame = frame => this.frame(paste, frame);
+    try {this.resources.encoder.paste(paste.text);} catch {paste.stopped = true; paste.failure = 'paste';}
+    finally {this.onFrame = null;}
+    if (paste.stopped) {this.refuse(paste, paste.failure); return;}
+    if (paste.offset !== paste.expected.length) {this.refuse(paste, 'incomplete'); return;}
+    if (!this.allowed(paste)) {this.refuse(paste, 'guard'); return;}
+    this.finish(paste, 'paste', null);
+  }
+  private frame(paste: InsertionPaste, frame: string): void {
+    if (paste.stopped || paste.settled) return;
+    if (!this.allowed(paste)) {paste.stopped = true; paste.failure = 'guard'; return;}
+    if (!frame || !paste.expected.startsWith(frame, paste.offset)) {
+      paste.stopped = true; paste.failure = 'incomplete'; return;
+    }
+    const p = this.p, bytes = new TextEncoder().encode(frame), revision = p.lease.revision;
+    try {
+      // A paste never completes H ownership, even for a frame containing only CR.
+      const delivered = this.native!.write(bytes, false, {
+        control: (id, dirty) => p.transport.control(id, dirty),
+        data: payload => {
+          // H can reenter application code. At the actual D boundary allow
+          // exactly our write's one revision increment.
+          if (this.released || !p.mode.valid || !p.mode.value || !p.valid() || !paste.guard()
+            || !p.lease.canInsert() || p.lease.revision !== revision + 1) {
+            paste.failure = 'guard'; throw Error('insertion guard revoked');
+          }
+          paste.attempted = true; p.transport.data(payload);
         },
       });
-    },
-  };
+      if (!delivered) {paste.stopped = true; paste.failure ??= 'send'; return;}
+    } catch {paste.stopped = true; paste.failure = 'send'; return;}
+    paste.frames++; paste.wireBytes += bytes.byteLength; paste.offset += frame.length;
+  }
 }

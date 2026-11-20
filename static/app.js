@@ -8382,6 +8382,9 @@ function inlineReasonText(code) {
     permissionDenied: "dictation.message.permissionDenied", audioLimit: "dictation.message.audioLimit",
     recordingError: "dictation.message.recordingError", microphoneInterrupted: "dictation.message.microphoneInterrupted",
     durationLimit: "dictation.message.durationLimit", invalidAudio: "dictation.message.invalidAudio",
+    not_configured: "dictation.inline.not_configured", invalid_configuration: "dictation.inline.invalid_configuration",
+    runtime_unavailable: "dictation.inline.runtime_unavailable", startup_timeout: "dictation.inline.startup_timeout",
+    worker_failed: "dictation.inline.worker_failed",
   };
   return code ? t(keys[code] || "dictation.inline.failure") : "";
 }
@@ -8404,11 +8407,15 @@ function renderInlineDictation(onlyPane = null) {
     const localReason = inlineContextReason(inlineContext(pane), true);
     let controllerReason = session ? inlineDictation.reason(session) : "unavailable";
     if (!localReason && ["idle", "recovery"].includes(session?.state) && controllerReason === "ineligible") controllerReason = "";
-    const reason = localReason || controllerReason;
+    const serviceReason = inlineDictation?.disabledReason();
+    const reason = serviceReason || localReason || controllerReason;
     const capturing = session?.state === "requesting" || session?.state === "recording";
     button.setAttribute("aria-disabled", String(!!reason && !capturing));
-    button.setAttribute("aria-pressed", String(session?.state === "recording")); button.title = inlineReasonText(reason) || t("dictation.holdHint");
-    status.textContent = inlineStateLabel(session) || inlineReasonText(reason)
+    button.setAttribute("aria-pressed", String(session?.state === "recording"));
+    button.title = inlineReasonText(reason) || t("dictation.holdHint");
+    if (!status.id) status.id = `dictation-status-${crypto.randomUUID()}`;
+    button.setAttribute("aria-describedby", status.id);
+    status.textContent = inlineReasonText(serviceReason) || inlineStateLabel(session) || inlineReasonText(reason)
       || (touch ? t("dictation.inline.phoneIdle") : t("dictation.inline.idle"));
     status.dataset.state = session?.state || "idle";
   }

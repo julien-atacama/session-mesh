@@ -3,6 +3,7 @@
 // MESH_CHROMIUM: required actual-page browser tests, discovered by the browser shards.
 // Actual application assets with test-owned API/media/socket peers; not phone or native-PTY proof.
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import {test, harness, select, wire, type Sockets, type Writes} from '../checks/dictation-browser-fixture.ts';
 import type {Page} from 'playwright-core';
 import {waitFor} from './ptyhost-wire-lib.ts';
@@ -48,6 +49,65 @@ async function finish(page: Page, api: any, name: string, text: string): Promise
     {name, created});
 }
 function payload(writes: Writes, key: string): Buffer[] {return wire(writes, key).map(value => Buffer.from(value));}
+
+for (const locale of ['en', 'fr']) for (const phone of [false, true]) {
+  test(`${locale} ${phone ? 'phone' : 'desktop'} microphone explains service disable before local eligibility`, async () => {
+    const catalog = JSON.parse(readFileSync(new URL(`../static/i18n/${locale}.json`, import.meta.url), 'utf8'));
+    const codes = ['not_configured', 'invalid_configuration', 'runtime_unavailable', 'startup_timeout', 'worker_failed'];
+    await harness(async (page, api, _sockets, writes) => {
+      api.inventory.mesh[0]!.agent = {type: 'shell', foreground: true, status: 'idle'};
+      let reason: unknown;
+      await page.route('**/api/transcribe/config', route => route.fulfill({json: {enabled: false,
+        disabled_reason: reason, message: '<img src=x onerror=alert(1)>'}}));
+      for (reason of [...codes, undefined, '<img src=x onerror=alert(1)>']) {
+        await page.reload();
+        const key = codes.includes(reason as string) ? `dictation.inline.${reason}` : 'dictation.message.unavailable';
+        const expected = catalog[key]; assert.equal(typeof expected, 'string');
+        const mic = page.locator('.pane.active [data-act="dictate"]');
+        const status = page.locator('.pane.active .p-inline-dictation-status');
+        await page.waitForFunction(expected => document.querySelector('.pane.active [data-act="dictate"]')
+          ?.getAttribute('title') === expected, expected);
+        assert.equal(await mic.isVisible(), true); assert.equal(await status.isVisible(), true);
+        assert.equal(await mic.getAttribute('aria-disabled'), 'true');
+        assert.equal(await status.textContent(), expected);
+        assert.equal(await mic.getAttribute('aria-describedby'), await status.getAttribute('id'));
+        await mic.focus(); await page.keyboard.down('Enter'); await page.keyboard.up('Enter');
+        const box = await mic.boundingBox(); assert.ok(box);
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+        await page.mouse.down(); await page.mouse.up();
+        assert.equal(await page.evaluate(() => (window as any).micCalls), 0);
+        assert.equal(await status.locator('img').count(), 0);
+      }
+      assert.equal(api.uploads.length, 0);
+      assert.ok([...writes.values()].every(frames => frames.filter(Buffer.isBuffer).length === 0));
+    }, false, locale, {rows: 24, cols: 80}, {hasTouch: phone, isMobile: phone,
+      viewport: {width: phone ? 390 : 1280, height: 844}});
+  });
+}
+
+for (const phone of [false, true]) test(`worker loss while polling explains the cause on ${phone ? 'phone' : 'desktop'}`, async () => {
+  await harness(async (page, api, sockets, writes) => {
+    await mode(sockets, 'A'); await hold(page);
+    await waitFor('original audio admission', 5000, () => api.jobs.length === 1);
+    const job = api.jobs[0]!;
+    await page.route('**/api/transcribe/**', route => route.fulfill({json: route.request().url().endsWith('/config')
+      ? {enabled: false, disabled_reason: 'worker_failed'} : {error: {code: 'disabled', message: '<b>private</b>'}},
+    status: route.request().url().endsWith('/config') ? 200 : 503}));
+    api.ack('A');
+    await page.waitForFunction(() => inlineDictation.disabledReason() === 'worker_failed');
+    const mic = page.locator('.pane.active [data-act="dictate"]');
+    const status = page.locator('.pane.active .p-inline-dictation-status');
+    assert.match(await mic.getAttribute('title') || '', /worker stopped or failed to start/);
+    assert.equal(await status.textContent(), await mic.getAttribute('title'));
+    assert.equal(await mic.getAttribute('aria-disabled'), 'true');
+    assert.equal(await page.evaluate(() => inlineDictation.session('A', 1).requestId), job.request_id);
+    assert.equal(await page.evaluate(() => inlineDictation.holds().length), 1);
+    await mic.focus(); await page.keyboard.down('Enter'); await page.keyboard.up('Enter');
+    assert.equal(await page.evaluate(() => (window as any).micCalls), 1);
+    assert.equal(api.uploads.length, 1); assert.deepEqual(payload(writes, 'A:0'), []);
+  }, false, 'en', {rows: 24, cols: 80}, {hasTouch: phone, isMobile: phone,
+    viewport: {width: phone ? 390 : 1280, height: 844}});
+});
 
 test('the native microphone icon is painted in compact desktop and touch headers', async () => {
   for (const width of [1280, 390]) {

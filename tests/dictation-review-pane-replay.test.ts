@@ -373,15 +373,17 @@ for (const touch of [false, true]) test(`${touch ? 'phone' : 'native'} app chann
 });
 test('inline header marks recording only after permission and recorder startup', () => {
   const attributes = new Map<string,string>(), button = {setAttribute(key: string,value: string) {attributes.set(key,value);}};
-  const status = {dataset: {}}, session = {state: 'requesting'};
+  const status = {id: 'native-status', dataset: {}}, session = {state: 'requesting'};
   const pane = {id: 'A',conn: {name: 'A',created: 1},el: {querySelector(selector: string) {return selector.includes('dictate') ? button : status;}}};
   const context = vm.createContext({panes: [pane],touch: false,t: (key: string) => key,
     find: () => ({kind: 'mesh'}),inlineContext: () => ({}),inlineContextReason: () => '',inlineContexts: new WeakMap(),
-    inlineStateLabel: () => '',inlineReasonText: () => '',inlineDictation: {holds: () => [session],session: () => session,reason: () => ''}});
+    inlineStateLabel: () => '',inlineReasonText: () => '',inlineDictation: {
+      holds: () => [session],session: () => session,reason: () => '',disabledReason: () => null}});
   vm.runInContext(source.slice(source.indexOf('function renderInlineDictation('),source.indexOf('function renderDictationBadges(')),context);
   context.renderInlineDictation();
   assert.equal(attributes.get('aria-pressed'),'false','permission-pending is not recording');
   assert.equal(attributes.get('aria-disabled'),'false','the pending hold remains cancellable');
+  assert.equal(attributes.get('aria-describedby'), 'native-status');
   session.state = 'recording'; context.renderInlineDictation(); assert.equal(attributes.get('aria-pressed'),'true');
   session.state = 'idle'; context.renderInlineDictation(); assert.equal(attributes.get('aria-pressed'),'false');
 });

@@ -470,3 +470,110 @@ test('retired refusal retains its inline diagnostic but never an error-state or 
   assert.equal(f.session.job, null); assert.equal(await f.controller.press(f.session), true);
   assert.equal(f.session.message, ''); f.controller.dispose();
 });
+
+test('disabled service reasons are closed, terminal and take precedence over local eligibility', async () => {
+  const codes = ['not_configured', 'invalid_configuration', 'runtime_unavailable', 'startup_timeout', 'worker_failed'];
+  for (const code of [...codes, undefined, 'unknown', '__proto__', '<img onerror=alert(1)>', {}, ['worker_failed'], null]) {
+    const f = fixture();
+    f.setRequest(async () => response({enabled: false, disabled_reason: code, message: 'never display this'}));
+    f.setEligible(false); f.ports.media.supported = () => false;
+    await f.controller.start();
+    const expected = typeof code === 'string' && codes.includes(code) ? code : 'unavailable';
+    assert.equal(f.controller.disabledReason(), expected);
+    assert.equal(f.controller.reason(f.session), expected);
+    assert.equal(await f.controller.press(f.session), false);
+    await f.advance(120000); f.controller.suspendForPageCache(); f.controller.resumeFromPageCache(); await flush();
+    assert.equal(f.calls.length, 1, 'permanent disable never retries or asks for media');
+    assert.equal(f.counts().permissionCalls, 0); assert.equal(f.counts().retained, 0);
+    f.controller.dispose();
+  }
+});
+
+test('healthy configuration ignores both automatic and explicit language metadata', async () => {
+  for (const language of [null, 'fr']) {
+    const f = fixture(), base = f.defaultRequest;
+    f.setRequest(async (path, init) => path.endsWith('/config')
+      ? response({enabled: true, language, max_bytes: 1024, capture_seconds: 2}) : base(path, init));
+    await f.controller.start();
+    assert.equal(f.controller.disabledReason(), null); await record(f);
+    assert.deepEqual(f.pastes, ['bonjour A']); f.controller.dispose();
+  }
+});
+
+test('observed worker loss stops another unreleased microphone but retains its admitted original job', async () => {
+  const f = fixture(), base = f.defaultRequest, b = f.controller.session('B', 2); let lost = false;
+  f.setRequest(async (path, init) => {
+    if (lost) return path.endsWith('/config') ? response({enabled: false, disabled_reason: 'worker_failed'})
+      : response({error: {code: 'disabled'}}, 503);
+    const r = await base(path, init);
+    return path === '/api/transcribe' ? response({...f.job()!, state: 'processing', text: null}) : r;
+  });
+  await f.controller.start(); await record(f); const id = f.session.requestId;
+  assert.equal(await f.controller.press(b), true);
+  lost = true; await f.advance(1000); f.controller.release(b);
+  assert.equal(b.state, 'idle'); assert.equal(b.outstanding, false);
+  assert.equal(f.session.requestId, id); assert.deepEqual(f.controller.holds(), [f.session]);
+  assert.equal(f.controller.reason(b), 'worker_failed');
+  assert.equal(f.calls.filter(call => call.path === '/api/transcribe').length, 1);
+  assert.equal(f.counts().stopped, 2); assert.deepEqual(f.pastes, []); f.controller.dispose();
+});
+
+test('worker loss during polling explains the cause without clearing uncertainty or replaying audio', async () => {
+  const f = fixture(), base = f.defaultRequest; let lost = false;
+  f.setRequest(async (path, init) => {
+    if (lost) return path.endsWith('/config') ? response({enabled: false, disabled_reason: 'worker_failed'})
+      : response({error: {code: 'disabled', message: 'private diagnostic must not escape'}}, 503);
+    const r = await base(path, init);
+    return path === '/api/transcribe' ? response({...f.job()!, state: 'processing', text: null}) : r;
+  });
+  await f.controller.start(); await record(f); const id = f.session.requestId;
+  lost = true; await f.advance(1000);
+  assert.equal(f.controller.disabledReason(), 'worker_failed');
+  assert.equal(f.controller.reason(f.session), 'worker_failed');
+  assert.ok(['unavailable', 'worker_failed'].includes(f.session.message));
+  assert.equal(f.session.requestId, id); assert.ok(f.session.outstanding);
+  assert.deepEqual(f.controller.holds(), [f.session]);
+  assert.equal(await f.controller.press(f.controller.session('B', 2)), false);
+  await f.advance(120000);
+  assert.equal(f.session.requestId, id, 'unconfirmed cancellation must retain identity');
+  assert.equal(f.calls.filter(c => c.path.endsWith('/config')).length, 2, 'one bounded diagnostic refresh');
+  assert.equal(f.calls.filter(c => c.path === '/api/transcribe').length, 1);
+  assert.equal(f.counts().permissionCalls, 1); assert.deepEqual(f.pastes, []); f.controller.dispose();
+});
+
+test('a stalled disable-cause refresh cannot extend the original result and cleanup bounds', async () => {
+  const f = fixture(), base = f.defaultRequest, pending = deferred<Response>(); let lost = false;
+  f.setRequest(async (path, init) => {
+    if (lost) return path.endsWith('/config') ? pending.promise : response({error: {code: 'disabled'}}, 503);
+    const r = await base(path, init);
+    return path === '/api/transcribe' ? response({...f.job()!, state: 'processing', text: null}) : r;
+  });
+  await f.controller.start(); await record(f); const id = f.session.requestId;
+  lost = true; await f.advance(1000);
+  assert.equal(f.controller.disabledReason(), 'unavailable');
+  await f.advance(39000);
+  assert.equal(f.session.state, 'idle'); assert.equal(f.session.message, 'cleanupUnavailable');
+  assert.equal(f.session.requestId, id); const calls = f.calls.length;
+  await f.advance(120000); assert.equal(f.calls.length, calls);
+  pending.resolve(response({enabled: true, max_bytes: 1024, capture_seconds: 2})); await flush();
+  assert.equal(await f.controller.press(f.session), false, 'late diagnostics cannot reopen capture');
+  assert.deepEqual(f.pastes, []); f.controller.dispose();
+});
+
+test('inline transcript filtering covers every forbidden control, trim and length boundaries', async () => {
+  const controls = Array.from({length: 160}, (_, code) => code)
+    .filter(code => code < 32 && code !== 9 && code !== 10 || code >= 127);
+  const invalid = [...controls.map(code => `hello${String.fromCharCode(code)}`), '', ' \t\n', 'x'.repeat(32769)];
+  for (const text of [...invalid, 'é\t\nhello', '~\u00a0\u2028', 'é'.repeat(32768)]) {
+    const f = fixture(), base = f.defaultRequest;
+    f.setRequest(async (path, init) => {
+      const r = await base(path, init);
+      return path.endsWith('/config') || path.endsWith('/settle') || path.endsWith('/cancel')
+        ? r : response({...f.job()!, text});
+    });
+    await f.controller.start(); await record(f);
+    assert.deepEqual(f.pastes, invalid.includes(text) ? [] : [text], JSON.stringify(text.slice(0, 20)));
+    if (invalid.includes(text)) assert.equal(f.counts().claims, 0);
+    f.controller.dispose();
+  }
+});

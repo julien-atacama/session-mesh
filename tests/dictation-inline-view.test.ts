@@ -3,6 +3,9 @@
 
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
+import {getEventListeners} from 'node:events';
+import {readFileSync} from 'node:fs';
+import ts from 'typescript';
 import {createInlineDictationView} from '../static/dictation-inline-view.ts';
 
 class Button extends EventTarget {
@@ -123,4 +126,36 @@ for (const key of [' ', 'Enter']) test(`fresh ${JSON.stringify(key)} after windo
     f.emit('keydown', f.a, {key, repeat: false}); f.emit('keyup', f.a, {key});
     assert.deepEqual(f.calls, ['press:A', 'cancel:A', 'press:A', 'release:A']);
   } finally {f.close();}
+});
+
+test('active view disposal cancels once and removes the exact delegated listener set', () => {
+  const f = fixture();
+  const events = ['pointerdown', 'pointerup', 'pointercancel', 'lostpointercapture', 'keydown', 'keyup',
+    'focusout', 'visibilitychange', 'click', 'contextmenu'];
+  try {
+    for (const event of events) assert.equal(getEventListeners(f.document, event).length, 1, event);
+    assert.equal(getEventListeners(f.window, 'blur').length, 1);
+    f.emit('keydown', f.a, {key: 'Enter'});
+    f.view.dispose(); f.view.dispose();
+    f.emit('keyup', f.a, {key: 'Enter'}); f.window.dispatchEvent(new Event('blur'));
+    assert.deepEqual(f.calls, ['press:A', 'cancel:A']);
+    for (const event of events) assert.equal(getEventListeners(f.document, event).length, 0, event);
+    assert.equal(getEventListeners(f.window, 'blur').length, 0);
+  } finally {f.close();}
+});
+
+test('inline view and native insertion helpers stay focused below fifty lines', () => {
+  for (const file of ['dictation-inline-view.ts', 'dictation-channel.ts']) {
+    const text = readFileSync(new URL(`../static/${file}`, import.meta.url), 'utf8');
+    const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+    const visit = (node: ts.Node): void => {
+      if (ts.isFunctionLike(node) && node.body) {
+        const start = source.getLineAndCharacterOfPosition(node.getStart()).line;
+        const end = source.getLineAndCharacterOfPosition(node.end).line;
+        assert.ok(end - start + 1 < 50, `${file}:${start + 1}: ${end - start + 1} lines`);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
 });

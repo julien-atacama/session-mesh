@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Atacama <contact@atacama.tech>
 
 import type {DictationChannel} from './dictation.ts';
+import {hasDictationControls} from '../shared/dictation-text.ts';
 
 export interface InlineJob {
   job_id: string; request_id: string; session: string; created: number;
@@ -29,6 +30,12 @@ export interface InlineDictationPorts {
 }
 interface Config {enabled: boolean; max_bytes: number; capture_seconds: number;
   queue_wait_seconds?: number; active_timeout_seconds?: number; result_ttl_seconds?: number}
+const DISABLED_REASONS = ['not_configured', 'invalid_configuration', 'runtime_unavailable',
+  'startup_timeout', 'worker_failed'] as const;
+type DisabledReason = typeof DISABLED_REASONS[number] | 'unavailable';
+function disabledReason(value: unknown): DisabledReason {
+  return DISABLED_REASONS.find(code => code === value) ?? 'unavailable';
+}
 interface Hold {
   session: InlineSession; active: boolean; cancel(): void; cancelled: Promise<void>;
   stream: MediaStream | null; recorder: MediaRecorder | null; chunks: Blob[]; bytes: number;
@@ -42,7 +49,7 @@ interface Details {
 const CLEANUP_MS = 30000;
 const ABANDONED_CANCEL_MS = 5000;
 const validText = (value: unknown): value is string => typeof value === 'string' && !!value.trim()
-  && value.length <= 32768 && !/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(value);
+  && value.length <= 32768 && !hasDictationControls(value);
 
 export class InlineDictationController {
   private readonly p: InlineDictationPorts;
@@ -54,6 +61,7 @@ export class InlineDictationController {
   private configurationGeneration = 0;
   private configurationLoading: number | null = null; private configurationTerminal = false;
   private configurationTimer: number | null = null; private configurationFailures = 0;
+  private serviceDisabled: DisabledReason | null = null; private serviceFailureChecked = false;
   constructor(ports: InlineDictationPorts) {this.p = ports;}
   private key(name: string, created: number): string {return JSON.stringify([this.p.namespace, name, created]);}
   session(name: string, created: number): InlineSession {
@@ -118,21 +126,27 @@ export class InlineDictationController {
     this.started = true; this.client = this.p.uuid();
     await this.configure();
   }
-  private async configure(): Promise<void> {
-    if (!this.allowed() || this.config || this.configurationTerminal || this.configurationLoading !== null) return;
+  private async configure(refresh = false): Promise<void> {
+    if (!this.allowed() || (!refresh && (this.config || this.configurationTerminal))
+      || this.configurationLoading !== null) return;
     const generation = ++this.configurationGeneration;
     this.configurationLoading = generation;
     let retry = false;
     try {
-      const {response, value} = await this.read('/api/transcribe/config'); const c = value as Config;
+      const {response, value} = await this.read('/api/transcribe/config', {cache: 'no-store'});
+      const c = value as Config & {disabled_reason?: unknown};
       if (generation !== this.configurationGeneration || !this.allowed()) return;
-      retry = response.status >= 500;
+      retry = !refresh && response.status >= 500;
+      if (response.ok && c?.enabled === false) {
+        this.serviceDisabled = disabledReason(c.disabled_reason);
+        if (this.hold) this.cancelHold(this.hold);
+      }
       if (response.ok && c?.enabled === true && Number.isSafeInteger(c.max_bytes)
         && c.max_bytes > 0 && Number.isSafeInteger(c.capture_seconds) && c.capture_seconds > 0) {
         this.config = c; this.configurationFailures = 0;
       }
       this.configurationTerminal = !retry;
-    } catch {retry = true; /* Transient unavailability never acquires media. */ }
+    } catch {retry = !refresh; /* Transient unavailability never acquires media. */ }
     finally {
       if (generation === this.configurationGeneration) {
         this.configurationLoading = null;
@@ -146,8 +160,21 @@ export class InlineDictationController {
     }
     this.notify();
   }
+  disabledReason(): DisabledReason | null {return this.serviceDisabled;}
+  private serviceFailure(response: Response, value: unknown): void {
+    const error = (value as {error?: {code?: unknown}} | null)?.error;
+    if (response.status !== 503 || error?.code !== 'disabled' || this.serviceFailureChecked) return;
+    // A closed relay refusal blocks new capture immediately. Refresh only the safe
+    // config cause once; keep all original request identities and cleanup bounds.
+    this.serviceFailureChecked = true; this.serviceDisabled = 'unavailable';
+    if (this.hold) this.cancelHold(this.hold);
+    // Diagnostics must not extend an existing job's result/cleanup deadline.
+    void this.configure(true); this.notify();
+  }
   reason(s: InlineSession): string {
-    if (!this.allowed() || !this.config || !this.details.has(s) || !Number.isFinite(s.created) || s.created <= 0) return 'unavailable';
+    if (!this.allowed()) return 'unavailable';
+    if (this.serviceDisabled) return this.serviceDisabled;
+    if (!this.config || !this.details.has(s) || !Number.isFinite(s.created) || s.created <= 0) return 'unavailable';
     if (!this.p.media.supported()) return 'unsupported';
     if (this.hold) return 'microphoneBusy';
     const d = this.details.get(s)!;
@@ -270,6 +297,8 @@ export class InlineDictationController {
         'X-Mesh-Request-Id': s.requestId!}, body: audio}, this.p.now() + CLEANUP_MS, s);
       if (!this.current(s, generation)) return;
       if (!response.ok) {
+        this.serviceFailure(response, value);
+        if (!this.current(s, generation)) return;
         if (response.status < 500) {this.finish(s, 'admissionRejected'); return;}
         throw Error('admission');
       }
@@ -303,11 +332,11 @@ export class InlineDictationController {
         {headers: this.headers(), cache: 'no-store'}, Math.min(d.expires, this.p.now() + CLEANUP_MS), s);
       if (!this.current(s, generation)) return;
       if (response.status === 404) {this.finish(s, 'jobMissing'); return;}
-      if (!response.ok) throw Error('status');
+      if (!response.ok) {this.serviceFailure(response, value); throw Error('status');}
       this.accept(s, this.job(s, value));
     } catch {
       if (!this.current(s, generation)) return;
-      s.message = 'statusUnavailable'; this.notify(); this.pollLater(s);
+      s.message = this.serviceDisabled || 'statusUnavailable'; this.notify(); this.pollLater(s);
     }
   }
   private async deliver(s: InlineSession): Promise<void> {
@@ -324,8 +353,13 @@ export class InlineDictationController {
         {headers: this.headers(), cache: 'no-store'}, Math.min(d.expires, this.p.now() + CLEANUP_MS), s);
       if (!this.current(s, generation)) return;
       if (response.status === 404) {this.finish(s, 'jobMissing'); return;}
+      if (!response.ok) {
+        this.serviceFailure(response, value);
+        if (!this.current(s, generation)) return;
+        throw Error('status');
+      }
       const verified = this.job(s, value);
-      if (!response.ok || verified.state !== 'ready' || verified.text !== expected.text || !validText(verified.text)
+      if (verified.state !== 'ready' || verified.text !== expected.text || !validText(verified.text)
         || !guard() || !this.fresh(s) || !d.channel!.claim() || !guard()) throw Error('guard');
       d.attempted = true;
       d.timer = this.p.schedule(() => {if (this.current(s, generation)) void this.cleanup(s, 'cancel', 'deliveryUncertain');},
@@ -385,7 +419,7 @@ export class InlineDictationController {
           : {headers: this.headers(), cache: 'no-store'}, deadline, s);
         if (!this.current(s, generation)) return false;
         if (known && response.status === 404) return complete();
-        if (!response.ok) throw Error('unconfirmed');
+        if (!response.ok) {this.serviceFailure(response, value); throw Error('unconfirmed');}
         const job = this.job(s, value); s.job = {...job, text: null};
         if (job.state === 'settled' || job.state === 'cancelled') return complete();
         statusFirst = false;

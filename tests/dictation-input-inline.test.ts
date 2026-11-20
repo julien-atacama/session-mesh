@@ -288,7 +288,9 @@ test('inline channel: fragmented framing and CR data preserve H and advance each
 });
 
 test('inline channel: disabled/invalid mode and prohibited transcript controls cause zero attempts', () => {
-  for (const text of ['', '\x00', '\x08', '\r', '\x1b[201~', '\x7f', '\x80', '\x9f']) {
+  const controls = Array.from({length: 160}, (_, code) => code)
+    .filter(code => code < 32 && code !== 9 && code !== 10 || code >= 127);
+  for (const text of ['', '\x1b[201~', ...controls.map(code => `hello${String.fromCharCode(code)}`)]) {
     const f = channelFixture(), channel = f.make(), results: string[] = [];
     channel.claim(); channel.deliver(text, result => results.push(result.kind), () => true);
     assert.deepEqual(results, ['refused'], JSON.stringify(text));
@@ -302,6 +304,17 @@ test('inline channel: disabled/invalid mode and prohibited transcript controls c
     channel.claim(); invalidate(f);
     channel.deliver('safe', result => results.push(result.kind), () => true);
     assert.deepEqual(results, ['refused']); assert.deepEqual(f.frames, []); channel.release();
+  }
+});
+
+test('inline channel permits TAB/LF and printable control-boundary neighbors without an extra Enter', () => {
+  for (const text of ['hello\tworld', 'hello\nworld', ' ~\u00a0é\u2028']) {
+    const f = channelFixture(), channel = f.make(), results: string[] = [];
+    assert.equal(channel.claim(), true);
+    channel.deliver(text, result => results.push(result.kind), () => true);
+    assert.deepEqual(results, ['paste']);
+    assert.equal(f.frames.join(''), `\x1b[200~${text.replace(/\n/g, '\r')}\x1b[201~`);
+    assert.deepEqual(f.controls, [true]); channel.release();
   }
 });
 
