@@ -17,7 +17,7 @@ declare const active: any, inlineDictation: any, dictationInventoryReady: boolea
 declare const pendingClientVersion: string;
 declare function refresh(): Promise<unknown>;
 declare function setActive(pane: any): void;
-declare const MeshI18n: {ready: Promise<void>};
+declare const MeshI18n: {loaded: boolean};
 const chrome = process.env.MESH_CHROMIUM || '';
 const skip = !chrome && process.env.MESH_REQUIRE_BROWSER !== '1' ? 'MESH_CHROMIUM not set (controlled native editor)' : false;
 const quote = (text: string): string => "'" + text.replaceAll("'", "'\\''") + "'";
@@ -174,7 +174,9 @@ export async function withNativeEditor(run: (f: NativeFixture) => Promise<void>,
     const preferenceKey = await page.evaluate(() => `${meshContext.storagePrefix}.dictation-auto-send`);
     await page.evaluate(key => localStorage.setItem(key, 'true'), preferenceKey);
     await page.goto(`${base}/#${name}`); await page.reload();
-    await page.evaluate(() => MeshI18n.ready);
+    // A promise returned through CDP can be collected before it is serialized.
+    // The pane barrier below also waits for startup's awaited i18n initialization.
+    await page.waitForFunction(() => typeof MeshI18n !== 'undefined' && MeshI18n.loaded === true);
     await page.waitForFunction(name => active?.id === name && active.conn?.terminal?.isOpen() && dictationInventoryReady
       && !active.conn.replayPending && !active.conn.replaying && !active.conn.draining, name);
     const policy = (await context.request.get(base)).headers()['content-security-policy'] || '';

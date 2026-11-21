@@ -6,9 +6,29 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import vm from 'node:vm';
 import {spawn} from 'node:child_process';
 import {test} from 'node:test';
 import {encode,request,waitFor} from './ptyhost-wire-lib.ts';
+
+test('native fixture polls the synchronous i18n readiness signal without reading its promise', () => {
+  const source = fs.readFileSync('checks/dictation-inline-native-fixture.ts', 'utf8');
+  const match = source.match(/await page\.waitForFunction\((\(\) => [^\n]*MeshI18n\.loaded[^\n]*)\);/);
+  assert.ok(match, 'the native fixture waits on the public loaded flag');
+  const context = vm.createContext({});
+  const ready = vm.runInContext(`(${match[1]})`, context) as () => boolean;
+  assert.equal(ready(), false, 'an absent namespace is not ready');
+  let loaded: unknown = false;
+  context.MeshI18n = Object.defineProperties({}, {
+    loaded: {get: () => loaded},
+    ready: {get() {assert.fail('the fixture must not return the ready promise over CDP');}},
+  });
+  for (loaded of [undefined, null, false, 'ready', Promise.resolve(true)]) {
+    assert.equal(ready(), false, 'only a true boolean is ready');
+  }
+  loaded = true;
+  assert.equal(ready(), true);
+});
 
 for(const partial of [Buffer.alloc(0),encode('C',Buffer.from('[]')).subarray(0,6)]){
   test(`native fixture request rejects a premature close after ${partial.length} bytes`,{timeout:2000},async t=>{
