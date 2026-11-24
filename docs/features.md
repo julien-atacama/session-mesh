@@ -664,13 +664,15 @@ new terminal output, the host omits the hint and the browser uses the pane's own
 
 Hold the microphone in a local terminal's header to record; release it to transcribe. The operator
 must first [enable the Whisper relay](operations.md#whisper-dictation), and the browser must allow
-microphone access in a secure context (HTTPS, or a browser-trusted local origin). The initial
-supported targets are foreground Claude Code, Codex and Pi sessions at their normal input prompt.
+microphone access in a secure context (HTTPS, or a browser-trusted local origin). The header
+microphone works with any detected foreground agent that reports an idle prompt and whose
+verified terminal supports bracketed paste. It does not depend on the agent's provider.
 A disabled microphone has an explanatory title and status message.
 
 - **Desktop:** the transcript is inserted into the original terminal prompt without Enter. Edit it
   there and submit manually. Recognition can finish on a retained original connection after you
-  switch panes; it never reconnects by name to send a late result.
+  switch panes; it never reconnects by name to send a late result. A change of foreground
+  agent prevents a late insertion even if the terminal connection stays open.
 - **Phone:** the transcript fills the existing editable input line. Correct it and press Send or
   Enter yourself; dictation never activates Direct mode. The field must be empty, Direct and Ctrl
   modes must be off, and no native input may be pending. Editing the field or changing the active

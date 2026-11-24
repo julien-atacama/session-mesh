@@ -55,7 +55,7 @@ for (const locale of ['en', 'fr']) for (const phone of [false, true]) {
     const catalog = JSON.parse(readFileSync(new URL(`../static/i18n/${locale}.json`, import.meta.url), 'utf8'));
     const codes = ['not_configured', 'invalid_configuration', 'runtime_unavailable', 'startup_timeout', 'worker_failed'];
     await harness(async (page, api, _sockets, writes) => {
-      api.inventory.mesh[0]!.agent = {type: 'shell', foreground: true, status: 'idle'};
+      api.inventory.mesh[0]!.agent.foreground = false;
       let reason: unknown;
       await page.route('**/api/transcribe/config', route => route.fulfill({json: {enabled: false,
         disabled_reason: reason, message: '<img src=x onerror=alert(1)>'}}));
@@ -128,7 +128,7 @@ test('the native microphone icon is painted in compact desktop and touch headers
       assert.notEqual(enabled.display, 'none');
       assert.equal(enabled.visibility, 'visible');
       assert.notEqual(enabled.color, 'rgba(0, 0, 0, 0)');
-      api.inventory.mesh[0]!.agent = {type:'shell', foreground:true, status:'idle'};
+      api.inventory.mesh[0]!.agent.foreground = false;
       await page.reload();
       await page.waitForFunction(() => dictationInventoryReady);
       assert.equal(await mic.getAttribute('aria-disabled'), 'true');
@@ -156,6 +156,57 @@ test('phone dictation stays editable until the corrected prompt is manually sent
     assert.equal(await line.inputValue(), '');
     assert.equal(api.jobs[0]!.outcome, 'inserted');
   }, false, 'fr', {rows:24, cols:80}, {hasTouch:true, isMobile:true, viewport:{width:390,height:844}});
+});
+
+for (const backend of ['opencode', 'gemini', 'agy', 'copilot', 'vibe']) {
+  test(`additional backend ${backend} receives the transcript without Enter`, async () => {
+    await harness(async (page, api, sockets, writes) => {
+      api.inventory.mesh[0]!.agent.type = backend;
+      await page.evaluate(() => refresh());
+      await mode(sockets, 'A');
+      await page.waitForFunction(() => active.conn.terminal.dictationMode.value === true);
+      const mic = page.locator('.pane.active [data-act="dictate"]');
+      assert.equal(await mic.getAttribute('aria-disabled'), 'false', await mic.getAttribute('title') ?? '');
+      await hold(page); await finish(page, api, 'A', 'bonjour');
+      assert.deepEqual(payload(writes, 'A:0'), [Buffer.from('\x1b[200~bonjour\x1b[201~')]);
+    });
+  });
+}
+
+test('additional backend on a phone leaves an editable draft until manual Send', async () => {
+  await harness(async (page, api, sockets, writes) => {
+    api.inventory.mesh[0]!.agent.type = 'opencode';
+    await page.evaluate(() => refresh());
+    await mode(sockets, 'A');
+    await page.waitForFunction(() => active.conn.terminal.dictationMode.value === true);
+    const mic = page.locator('.pane.active [data-act="dictate"]');
+    assert.equal(await mic.getAttribute('aria-disabled'), 'false', await mic.getAttribute('title') ?? '');
+    await hold(page); await finish(page, api, 'A', 'bonjour');
+    const line = page.locator('#line-text');
+    assert.equal(await line.inputValue(), 'bonjour');
+    await line.fill('bonjour corrigé');
+    assert.deepEqual(payload(writes, 'A:0'), []);
+    await page.locator('#line button.primary').click();
+    await waitFor('manual send', 5000, () => Buffer.concat(payload(writes, 'A:0')).toString().endsWith('\r'));
+    assert.equal(Buffer.concat(payload(writes, 'A:0')).toString(), '\x1b[200~bonjour corrigé\x1b[201~\r');
+  }, false, 'en', {rows:24, cols:80}, {hasTouch:true, isMobile:true, viewport:{width:390,height:844}});
+});
+
+test('additional backend handoff during dictation sends nothing on the still-open terminal', async () => {
+  await harness(async (page, api, sockets, writes) => {
+    api.inventory.mesh[0]!.agent.type = 'opencode';
+    await page.evaluate(() => refresh());
+    await mode(sockets, 'A');
+    await page.waitForFunction(() => active.conn.terminal.dictationMode.value === true);
+    const mic = page.locator('.pane.active [data-act="dictate"]');
+    assert.equal(await mic.getAttribute('aria-disabled'), 'false', await mic.getAttribute('title') ?? '');
+    await hold(page);
+    await waitFor('original audio admission', 5000, () => api.jobs.length === 1);
+    api.inventory.mesh[0]!.agent.type = 'gemini';
+    await page.evaluate(() => refresh());
+    await finish(page, api, 'A', 'must not arrive');
+    assert.deepEqual(payload(writes, 'A:0'), []);
+  });
 });
 
 test('staged phone dictation keeps its exact origin through corrections and another active column', async () => {
@@ -363,7 +414,7 @@ test('AC-2: phone editable prompt and support boundary', async () => {
 
   await harness(async (page, api) => {
     // Change only the fake peer's inventory response, then reload so production consumes it.
-    api.inventory.mesh[0]!.agent = {type:'shell', foreground:true, status:'idle'};
+    api.inventory.mesh[0]!.agent.foreground = false;
     await page.reload(); await page.waitForFunction(() => dictationInventoryReady);
     const mic = page.locator('.pane.active [data-act="dictate"]');
     assert.equal(await mic.isVisible(), true); assert.equal(await mic.getAttribute('aria-disabled'), 'true');

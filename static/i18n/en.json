@@ -123,7 +123,7 @@
   "dictation.inline.idle": "Hold the microphone to dictate here. Edit in the terminal, then press Enter.",
   "dictation.inline.phoneIdle": "Hold the microphone to dictate into the input field. Correct the text, then send it.",
   "dictation.inline.phoneNativeInputBusy": "The phone dictation field requires no pending terminal input and Direct and Ctrl modes turned off.",
-  "dictation.inline.unsupportedTarget": "Dictation requires foreground Claude Code, Codex or Pi.",
+  "dictation.inline.unsupportedTarget": "Header dictation requires a detected agent in the foreground.",
   "dictation.inline.agentBusy": "The agent is working; wait for its prompt.",
   "dictation.inline.agentNotReady": "Wait for the agent’s normal input prompt before dictating.",
   "dictation.inline.bindingUnavailable": "The original terminal connection is not verified.",

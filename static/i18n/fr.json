@@ -123,7 +123,7 @@
   "dictation.inline.idle": "Maintiens le micro pour dicter ici. Corrige dans le terminal, puis appuie sur Entrée.",
   "dictation.inline.phoneIdle": "Maintiens le micro pour dicter dans le champ de saisie. Corrige le texte, puis envoie-le.",
   "dictation.inline.phoneNativeInputBusy": "Pour dicter dans le champ du téléphone, termine ou annule la saisie du terminal et désactive les modes Direct et Ctrl.",
-  "dictation.inline.unsupportedTarget": "La dictée nécessite Claude Code, Codex ou Pi au premier plan.",
+  "dictation.inline.unsupportedTarget": "Le micro de l’en-tête nécessite un agent détecté au premier plan.",
   "dictation.inline.agentBusy": "L’agent travaille ; attends son invite de saisie.",
   "dictation.inline.agentNotReady": "Attends l’invite de saisie normale de l’agent avant de dicter.",
   "dictation.inline.bindingUnavailable": "La connexion d’origine du terminal n’est pas vérifiée.",

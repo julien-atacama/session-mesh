@@ -8252,10 +8252,13 @@ function inlineContextReason(context, capture = false) {
   const {pane, connection, name, created, lease} = context;
   const identity = paneTargets.identity(name), session = find(name), terminal = connection?.terminal;
   if (!localMeshEffectsAllowed() || !dictationInventoryReady || identity?.name !== name
-       || identity.created !== created || session?.created !== created || !rowAuthoritative(session)) return "unavailable";
-  if (!MeshPaneActions.foregroundAgent(session)) return "unsupportedTarget";
-  if (session.agent?.status === "busy") return "agentBusy";
-  if (session.agent?.status !== "idle") return "agentNotReady";
+       || identity.created !== created || session?.kind !== "mesh" || session.created !== created
+       || !rowAuthoritative(session)) return "unavailable";
+  const agent = session.agent;
+  if (!agent?.type || agent.foreground !== true) return "unsupportedTarget";
+  if (agent.type !== context.agentType || agent.pid !== context.agentPid) return "contextChanged";
+  if (agent.status === "busy") return "agentBusy";
+  if (agent.status !== "idle") return "agentNotReady";
   if (!terminal?.isOpen() || !terminal.isBound(name, created) || connection.ended) return "bindingUnavailable";
   if (connection.replaying || connection.draining || connection.replayPending
       || !terminal.dictationMode.valid || !terminal.dictationMode.value) return "unsafePaste";
@@ -8267,8 +8270,9 @@ function inlineContextReason(context, capture = false) {
   return "";
 }
 function inlineContext(pane) {
-  const c = pane.conn;
-  return {pane, connection: c, name: c?.name, created: c?.created, lease: pane.inputLease};
+  const c = pane.conn, agent = find(c?.name)?.agent;
+  return {pane, connection: c, name: c?.name, created: c?.created, lease: pane.inputLease,
+    agentType: agent?.type, agentPid: agent?.pid};
 }
 function inlineSessionEligible(session) {
   const context = inlineContexts.get(session);
