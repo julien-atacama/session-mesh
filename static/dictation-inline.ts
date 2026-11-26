@@ -98,7 +98,9 @@ export class InlineDictationController {
   // Bound the entire response (including a stalled body) and race abort explicitly: test and
   // browser adapters need not resolve their promise merely because AbortSignal was aborted.
   private async read(path: string, init: RequestInit = {}, deadline = this.p.now() + CLEANUP_MS,
-    s?: InlineSession, signal?: AbortSignal, fatalAuthentication = true): Promise<{response: Response; value: unknown}> {
+    s?: InlineSession, signal?: AbortSignal, fatalAuthentication = true): Promise<{
+      response: Response; value: unknown; bodyReadFailed: boolean;
+    }> {
     if (!this.allowed() || signal?.aborted || this.p.now() >= deadline) throw Error('unavailable');
     const abort = new AbortController(), set = s ? this.details.get(s)!.io : this.io;
     set.add(abort);
@@ -112,9 +114,12 @@ export class InlineDictationController {
         const response = await this.p.request(path, {...init, signal: abort.signal});
         if (abort.signal.aborted || !this.allowed() || this.p.now() >= deadline) throw Error('aborted');
         if (fatalAuthentication && (response.status === 401 || response.status === 403)) {this.dispose(); throw Error('authentication');}
-        const value: unknown = await response.json().catch(() => null);
+        const body = await response.json().then(
+          (value: unknown) => ({value, bodyReadFailed: false}),
+          () => ({value: null, bodyReadFailed: true}),
+        );
         if (abort.signal.aborted || !this.allowed() || this.p.now() >= deadline) throw Error('aborted');
-        return {response, value};
+        return {response, ...body};
       })()]);
     } finally {
       this.p.unschedule(timer); abort.signal.removeEventListener('abort', rejectAbort); set.delete(abort);
@@ -133,10 +138,10 @@ export class InlineDictationController {
     this.configurationLoading = generation;
     let retry = false;
     try {
-      const {response, value} = await this.read('/api/transcribe/config', {cache: 'no-store'});
+      const {response, value, bodyReadFailed} = await this.read('/api/transcribe/config', {cache: 'no-store'});
       const c = value as Config & {disabled_reason?: unknown};
       if (generation !== this.configurationGeneration || !this.allowed()) return;
-      retry = !refresh && response.status >= 500;
+      retry = !refresh && (response.status >= 500 || (response.ok && bodyReadFailed));
       if (response.ok && c?.enabled === false) {
         this.serviceDisabled = disabledReason(c.disabled_reason);
         if (this.hold) this.cancelHold(this.hold);

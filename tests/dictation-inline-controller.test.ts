@@ -79,6 +79,22 @@ async function record(f: ReturnType<typeof fixture>, s: InlineSession = f.sessio
   assert.equal(await f.controller.press(s), true); f.controller.release(s); await flush();
 }
 
+test('an interrupted initial config body retries, but a disabled reply stops discovery', async () => {
+  const f = fixture();
+  f.setRequest(async () => new Response(new ReadableStream({
+    start(stream) { stream.error(Error('config response interrupted')); },
+  })));
+  await f.controller.start();
+  assert.equal(f.calls.length, 1);
+  f.setRequest(async () => response({enabled: false, disabled_reason: 'not_configured'}));
+  await f.advance(1000);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.controller.disabledReason(), 'not_configured');
+  await f.advance(30000);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.counts().permissionCalls, 0);
+});
+
 test('AC-5: inserted settlement and bounded cleanup', async t => {
   await t.test('production and strict browser fake agree on ready-only owned idempotent insertion', async () => {
     await assertInsertedEngineParity(); await assertInsertedFixtureParity();
