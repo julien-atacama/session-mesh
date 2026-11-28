@@ -113,7 +113,14 @@ export class InlineDictationController {
       return await Promise.race([aborted, (async () => {
         const response = await this.p.request(path, {...init, signal: abort.signal});
         if (abort.signal.aborted || !this.allowed() || this.p.now() >= deadline) throw Error('aborted');
-        if (fatalAuthentication && (response.status === 401 || response.status === 403)) {this.dispose(); throw Error('authentication');}
+        if (fatalAuthentication && (response.status === 401 || response.status === 403)) {
+          this.dispose();
+          for (const session of this.sessions.values()) {
+            session.requestId = null; session.job = null; session.state = 'idle'; session.message = '';
+          }
+          this.p.changed();
+          throw Error('authentication');
+        }
         const body = await response.json().then(
           (value: unknown) => ({value, bodyReadFailed: false}),
           () => ({value: null, bodyReadFailed: true}),
@@ -371,7 +378,7 @@ export class InlineDictationController {
         Math.max(0, Math.min(d.expires - this.p.now(), (this.config!.result_ttl_seconds ?? 1800) * 1000)));
       d.channel!.deliver(verified.text, result => {
         if (!this.current(s, generation) || s.state !== 'delivering') return;
-        if ((result.kind === 'paste' || result.kind === 'draft') && guard()) {
+        if (result.kind === 'paste' || result.kind === 'draft') {
           // Retire recognition after native insertion or phone-field staging, never submission.
           // Releasing the reference never clears native pending-input ownership (no clean H).
           void this.cleanup(s, 'inserted', '');
@@ -414,10 +421,10 @@ export class InlineDictationController {
       this.finish(s, d.cleanupMode === 'cancel' && s.message !== 'cleanupUnavailable' ? s.message : ''); return true;
     };
     while (this.current(s, generation) && this.p.now() < deadline) {
+      const known = s.job?.job_id;
+      const action = d.cleanupMode === 'inserted' ? 'settle' : 'cancel';
+      const control: boolean = !!known && !statusFirst;
       try {
-        const known = s.job?.job_id;
-        const action = d.cleanupMode === 'inserted' ? 'settle' : 'cancel';
-        const control = !!known && !statusFirst;
         const path = known ? `/api/transcribe/${known}${control ? `/${action}` : ''}` : `/api/transcribe/request/${s.requestId}`;
         const {response, value} = await this.read(path, control ? {method: 'POST',
           headers: {...this.headers(), 'Content-Type': 'application/json'}, body: JSON.stringify(action === 'settle' ? {outcome: 'inserted'} : {})}
@@ -430,7 +437,7 @@ export class InlineDictationController {
         statusFirst = false;
         // Lookup/status identified a still-live old job: cancel/settle immediately, not re-upload.
         if (!control) continue;
-      } catch {statusFirst = !!s.job;}
+      } catch {statusFirst = control && !!s.job;}
       if (this.current(s, generation) && this.p.now() < deadline) await this.wait(s, deadline);
     }
     if (this.current(s, generation)) {

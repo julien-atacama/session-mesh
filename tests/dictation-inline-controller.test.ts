@@ -125,6 +125,29 @@ test('AC-5: inserted settlement and bounded cleanup', async t => {
     await f.controller.start(); await record(f); await f.advance(1000);
     assert.equal(f.session.outstanding, false); assert.deepEqual(f.pastes, ['bonjour A']); f.controller.dispose();
   });
+  await t.test('uncertain settlement and failed status retry the same inserted control, never the paste', async () => {
+    const f = fixture(), base = f.defaultRequest; let settles = 0, statusFailures = 0;
+    f.setRequest(async (path, init) => {
+      if (path.endsWith('/settle') && ++settles === 1) throw Error('settlement not delivered');
+      if (path.includes('/job-') && !path.endsWith('/settle') && ++statusFailures === 2)
+        throw Error('status unavailable');
+      return base(path, init);
+    });
+    await f.controller.start(); await record(f);
+    const job = f.job()!, path = `/api/transcribe/${job.job_id}`;
+    await f.advance(3000);
+    const controls = f.calls.filter(c => c.path.startsWith('/api/transcribe/job-'));
+    assert.deepEqual(controls.map(c => [c.path, c.init.method || 'GET']), [
+      [path, 'GET'], [`${path}/settle`, 'POST'], [path, 'GET'], [`${path}/settle`, 'POST'],
+    ]);
+    assert.equal(settles, 2);
+    assert.ok(controls.filter(c => c.init.method === 'POST')
+      .every(c => JSON.parse(c.init.body as string).outcome === 'inserted'));
+    assert.equal(f.session.outstanding, false); assert.deepEqual(f.pastes, ['bonjour A']);
+    assert.equal(f.counts().inserted, 1);
+    const count = f.calls.length; await f.advance(60000); assert.equal(f.calls.length, count);
+    f.controller.dispose();
+  });
   await t.test('hung cleanup is aborted at 30s even if request ignores abort; late response is inert', async () => {
     const f = fixture(); const base = f.defaultRequest, pending = deferred<Response>(); let signal: AbortSignal | null | undefined;
     f.setRequest(async (path, init) => {
@@ -251,6 +274,27 @@ test('freshness, eligibility and preflight identity are rechecked before one-sho
   }
 });
 
+test('a current positive insertion receipt settles after eligibility changes, without rewriting input', async () => {
+  for (const kind of ['paste', 'draft']) {
+    const f = fixture(); let done!: (result: {kind: string}) => void, guard!: () => boolean;
+    f.setDeliver((text, callback, check) => {
+      assert.equal(check(), true); f.pastes.push(text); done = callback; guard = check;
+    });
+    await f.controller.start(); await record(f);
+    assert.equal(f.session.state, 'delivering');
+    f.setEligible(false); assert.equal(guard(), false);
+    done({kind}); await flush();
+    assert.equal(f.session.state, 'idle'); assert.equal(f.session.message, '');
+    assert.equal(f.session.outstanding, false); assert.deepEqual(f.pastes, ['bonjour A']);
+    assert.equal(f.counts().inserted, 1);
+    const settles = f.calls.filter(c => c.path.endsWith('/settle'));
+    assert.equal(settles.length, 1);
+    assert.equal(JSON.parse(settles[0].init.body as string).outcome, 'inserted');
+    assert.equal(f.calls.filter(c => c.path.endsWith('/cancel')).length, 0);
+    f.controller.dispose();
+  }
+});
+
 test('controller uses production insertion channel revision semantics, preserving own dirty H', async () => {
   const f = fixture(), controls: boolean[] = [], bytes: string[] = [], scope = createHumanInputScope();
   const transport = {control(_id: string, dirty: boolean) {controls.push(dirty);},
@@ -265,7 +309,7 @@ test('controller uses production insertion channel revision semantics, preservin
         onData(callback) {onData = callback; return {dispose() {}};}, dispose() {}})});
   };
   await f.controller.start(); await record(f);
-  assert.deepEqual(bytes, ['existing', '\x1b[200~', 'bonjour A', '\x1b[201~']);
+  assert.deepEqual(bytes, ['existing', '\x1b[200~bonjour A\x1b[201~']);
   assert.equal(f.session.outstanding, false); assert.equal(f.counts().inserted, 1);
   lease.write(new TextEncoder().encode('\x7f'), false); await record(f);
   assert.equal(f.counts().inserted, 2); assert.equal(lease.dirty, true); assert.deepEqual(controls, [true]);
@@ -381,12 +425,23 @@ test('lost inserted acknowledgement reconciles settled status and never repeats 
 
 test('authentication refusal during an admitted operation stops all controls and input', async () => {
   for (const status of [401, 403]) {
-    const f = fixture(); const base = f.defaultRequest;
-    f.setRequest(async (path, init) => path.includes('/job-') ? response({}, status) : base(path, init));
-    await f.controller.start(); await record(f); const count = f.calls.length;
+    const f = fixture(), denied = deferred<Response>(); const base = f.defaultRequest; let changed = 0;
+    f.ports.changed = () => {changed++;};
+    f.setRequest(async (path, init) => path.includes('/job-') ? denied.promise : base(path, init));
+    await f.controller.start(); await record(f);
+    const b = f.controller.session('B', 2);
+    assert.equal(await f.controller.press(b), true);
+    const count = f.calls.length, notifications = changed;
+    denied.resolve(response({}, status)); await flush();
+    assert.equal(f.controller.reason(f.session), 'unavailable');
+    assert.equal(f.session.outstanding, false); assert.equal(f.session.requestId, null);
+    assert.equal(f.session.job, null); assert.equal(b.outstanding, false);
+    assert.deepEqual(f.controller.holds(), []);
+    assert.ok(changed > notifications, 'authorization loss publishes a final unavailable state');
     await f.advance(60000); assert.equal(f.calls.length, count); assert.deepEqual(f.pastes, []);
-    assert.equal(await f.controller.press(f.session), false); assert.ok(f.counts().stopped);
-    assert.equal(f.counts().releases, 1);
+    f.controller.resumeFromPageCache(); await flush();
+    assert.equal(f.calls.length, count); assert.equal(await f.controller.press(f.session), false); assert.ok(f.counts().stopped);
+    assert.equal(f.counts().releases, 2);
   }
 });
 
@@ -398,19 +453,26 @@ test('suspension aborts an uncertain upload; authenticated resume only cancels i
   });
   await f.controller.start(); await record(f); const id = f.session.requestId;
   f.controller.suspendForPageCache(); assert.equal(signal?.aborted, true);
-  f.setRequest(async path => {
-    if (path.includes('/request/')) return response({job_id: 'old-job', request_id: id, session: 'A', created: 1,
+  f.setRequest(async (path, init) => {
+    if (path === `/api/transcribe/request/${id}` && (!init.method || init.method === 'GET'))
+      return response({job_id: 'old-job', request_id: id, session: 'A', created: 1,
       state: 'processing', text: null, error: null, outcome: null});
-    if (path.endsWith('/cancel')) return response({job_id: 'old-job', request_id: id, session: 'A', created: 1,
+    if (path === '/api/transcribe/old-job/cancel' && init.method === 'POST')
+      return response({job_id: 'old-job', request_id: id, session: 'A', created: 1,
       state: 'cancelled', text: null, error: null, outcome: null});
-    assert.fail(`unexpected request after resume: ${path}`);
+    assert.fail(`unexpected request after resume: ${init.method || 'GET'} ${path}`);
   });
   upload.resolve(response({job_id: 'old-job', request_id: id, session: 'A', created: 1,
     state: 'ready', text: 'must not insert', error: null, outcome: null})); await flush();
+  const beforeResume = f.calls.length;
   f.controller.resumeFromPageCache(); await flush();
   assert.equal(f.session.outstanding, false); assert.deepEqual(f.pastes, []);
   assert.equal(f.counts().permissionCalls, 1); assert.equal(f.counts().retained, 1);
-  assert.ok(f.calls.some(c => c.path === `/api/transcribe/request/${id}`)); f.controller.dispose();
+  assert.deepEqual(f.calls.slice(beforeResume).map(c => [c.path, c.init.method || 'GET']), [
+    [`/api/transcribe/request/${id}`, 'GET'], ['/api/transcribe/old-job/cancel', 'POST'],
+  ]);
+  const count = f.calls.length; await f.advance(60000); assert.equal(f.calls.length, count);
+  f.controller.dispose();
 });
 
 test('polling and a missing delivery callback are bounded, without renewing TTL or replaying', async () => {

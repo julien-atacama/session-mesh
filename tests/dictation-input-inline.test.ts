@@ -3,6 +3,8 @@
 
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
+import {readFileSync} from 'node:fs';
+import vm from 'node:vm';
 import {createHumanInputLease, createHumanInputScope, type HumanInputScope, type HumanInputTransport} from '../static/pane-actions.ts';
 import {createDictationChannel} from '../static/dictation-channel.ts';
 
@@ -114,6 +116,19 @@ test('a synchronous tracked-send failure is uncertain, never retried as plain in
   channel.deliver('draft',result=>results.push(result.kind),()=>true);
   assert.deepEqual(results,['uncertain']);
   assert.deepEqual(f.frames,[]);
+});
+
+test('an original positive ACK is not negated by a later negative receipt or failed queue return', () => {
+  const f = channelFixture({writeAcknowledged: (_bytes, _complete, settled) => {
+    settled(true);
+    settled(false);
+    return false;
+  }}), channel = f.make(), results: string[] = [];
+  assert.equal(channel.claim(), true);
+  channel.deliver('accepted', result => results.push(result.kind), () => true);
+  assert.deepEqual(results, ['paste']);
+  assert.deepEqual(f.frames, []);
+  channel.release();
 });
 
 function reopenedInput() {
@@ -303,14 +318,34 @@ test('inline channel: foreign, unknown and queued input block even an initially 
   }
 });
 
-test('inline channel: fragmented framing and CR data preserve H and advance each frame once', () => {
+test('inline channel: fragmented framing and CR data become one guarded write', () => {
   const f = channelFixture(), channel = f.make(), results: string[] = [];
   f.setPaste(() => {for (const frame of ['\x1b[200~', 'alpha', '\r', 'beta', '\x1b[201~']) f.emit(frame);});
   channel.claim(); const capture = f.lease.revision;
   channel.deliver('alpha\nbeta', result => results.push(result.kind), () => true);
-  assert.deepEqual(results, ['paste']); assert.equal(f.lease.revision, capture + 5);
-  assert.deepEqual(f.frames, ['\x1b[200~', 'alpha', '\r', 'beta', '\x1b[201~']);
+  assert.deepEqual(results, ['paste']); assert.equal(f.lease.revision, capture + 1);
+  assert.deepEqual(f.frames, ['\x1b[200~alpha\rbeta\x1b[201~']);
   assert.deepEqual(f.controls, [true]); channel.release();
+});
+
+test('inline channel: real xterm paste emits exactly one validated D frame', async () => {
+  const xterm = {exports: {} as any, module: {exports: {} as any}, self: {}, process, setTimeout, clearTimeout};
+  vm.runInNewContext(readFileSync('static/vendor/xterm.min.js', 'utf8'), xterm);
+  const term = new (xterm.exports.Terminal || xterm.module.exports.Terminal)();
+  term._core.textarea = {value: ''}; // xterm clears its browser textarea after emitting paste data.
+  const f = input(), pane = {}, target = {pane, id: 'A', name: 'A', sessionId: 'A', displayName: 'A',
+    created: 1, view: 1, kind: 'mesh' as const, available: true, activeSensitive: false};
+  const channel = createDictationChannel({target, socket: {send() {throw Error('no direct socket write');}},
+    lease: f.lease, encoder: () => term, valid: () => true, release() {}, mode: {
+      value: true, valid: true, bytes() {}, dispose() {},
+    }, transport: f.transport, insertionOnly: true});
+  assert.equal(channel.claim(), true);
+  const result = await new Promise<string>(resolve =>
+    channel.deliver('alpha\nbeta', value => resolve(value.kind), () => true));
+  assert.equal(result, 'paste');
+  assert.deepEqual(f.controls, [true]);
+  assert.deepEqual(f.frames, ['\x1b[200~alpha\rbeta\x1b[201~']);
+  channel.release();
 });
 
 test('inline channel: disabled/invalid mode and prohibited transcript controls cause zero attempts', () => {
@@ -357,7 +392,7 @@ test('inline channel: late encoder callback rechecks mode, revision and release 
   }
 });
 
-test('inline channel: per-frame mode/revision loss and transport throws are uncertain, never replayed', () => {
+test('inline channel: encoder loss before validation refuses; actual transport throws stay uncertain', () => {
   for (const kind of ['mode', 'revision', 'transport', 'encoder'] as const) {
     const f = channelFixture(), channel = f.make(), results: string[] = [];
     if (kind === 'transport') f.transport.data = () => {throw Error('send may have queued bytes');};
@@ -365,11 +400,12 @@ test('inline channel: per-frame mode/revision loss and transport throws are unce
       f.emit('\x1b[200~');
       if (kind === 'mode') f.mode.value = false;
       if (kind === 'revision') f.lease.atomic(encode('\x03'));
-      if (kind === 'encoder') throw Error('encoder failed after a frame');
+      if (kind === 'encoder') throw Error('encoder failed after validated prefix');
       f.emit('safe'); f.emit('\x1b[201~');
     });
     channel.claim(); channel.deliver('safe', result => results.push(result.kind), () => true);
-    assert.deepEqual(results, ['uncertain'], kind);
+    assert.deepEqual(results, [kind === 'transport' ? 'uncertain' : 'refused'], kind);
+    if (kind === 'mode' || kind === 'encoder') assert.deepEqual(f.controls, [], kind);
     const before = f.frames.length; f.emit('late callback');
     channel.deliver('replay', () => {}, () => true);
     assert.equal(f.frames.length, before); channel.release();
@@ -397,7 +433,7 @@ test('inline channel: native mode never accepts a plaintext encoder fallback', (
   assert.deepEqual(results, ['refused']); assert.deepEqual(f.frames, []); channel.release();
 });
 
-test('inline channel: pre-frame failure refuses, truncated or surplus framing is uncertain after an attempt', () => {
+test('inline channel: pre-frame failure, truncated or surplus framing refuse without an H/D attempt', () => {
   for (const kind of ['guard', 'encoder', 'unclaimed', 'truncated', 'surplus'] as const) {
     const f = channelFixture(), channel = f.make(), results: string[] = [];
     f.setPaste(() => {
@@ -408,11 +444,9 @@ test('inline channel: pre-frame failure refuses, truncated or surplus framing is
     });
     if (kind !== 'unclaimed') channel.claim();
     channel.deliver('safe', result => results.push(result.kind), () => true);
-    const partial = kind === 'truncated' || kind === 'surplus';
-    assert.deepEqual(results, [partial ? 'uncertain' : 'refused'], kind);
-    if (!partial) assert.deepEqual(f.frames, []);
-    else assert.equal(f.frames.length, 1);
-    assert.equal(f.controls.includes(false), false); channel.release();
+    assert.deepEqual(results, ['refused'], kind);
+    assert.deepEqual(f.frames, [], kind);
+    assert.deepEqual(f.controls, [], kind); channel.release();
   }
 });
 
@@ -424,7 +458,7 @@ test('inline channel: duplicate late readiness or a throw after readiness settle
   assert.deepEqual(results, ['paste']); assert.equal(f.frames.length, 1); channel.release();
 });
 
-test('inline channel: throwing guards refuse before attempts and are uncertain after a frame', () => {
+test('inline channel: throwing guards refuse even after an encoder prefix', () => {
   for (const afterFrame of [false, true]) {
     const f = channelFixture(), channel = f.make(), results: string[] = [];
     let fail = !afterFrame;
@@ -432,7 +466,70 @@ test('inline channel: throwing guards refuse before attempts and are uncertain a
     channel.claim(); channel.deliver('safe', result => results.push(result.kind), () => {
       if (fail) throw Error('revoked guard'); return true;
     });
-    assert.deepEqual(results, [afterFrame ? 'uncertain' : 'refused']);
-    assert.equal(f.frames.length, afterFrame ? 1 : 0); channel.release();
+    assert.deepEqual(results, ['refused']);
+    assert.deepEqual(f.frames, []); assert.deepEqual(f.controls, []); channel.release();
+  }
+});
+
+test('inline channel: complete encoder output is required before either native or legacy writes', () => {
+  for (const acknowledged of [false, true]) {
+    for (const kind of ['truncated', 'trailing', 'wrong', 'throw-after-prefix', 'throw-after-complete'] as const) {
+      const receipts: string[] = [], f = channelFixture(acknowledged ? {
+        writeAcknowledged: bytes => {receipts.push(new TextDecoder().decode(bytes)); return true;}
+      } : {}), channel = f.make(), results: string[] = [];
+      f.setPaste(() => {
+        f.emit('\x1b[200~');
+        if (kind === 'truncated') {f.emit('safe'); return;}
+        if (kind === 'throw-after-prefix') throw Error('encoder failed');
+        if (kind === 'wrong') f.emit('wrong');
+        else f.emit('safe\x1b[201~');
+        if (kind === 'trailing') f.emit('\r');
+        if (kind === 'throw-after-complete') throw Error('encoder failed');
+      });
+      channel.claim(); channel.deliver('safe', result => results.push(result.kind), () => true);
+      assert.deepEqual(results, ['refused'], `${acknowledged}: ${kind}`);
+      assert.deepEqual(f.controls, [], `${acknowledged}: ${kind}`);
+      assert.deepEqual(f.frames, [], `${acknowledged}: ${kind}`);
+      assert.deepEqual(receipts, [], `${acknowledged}: ${kind}`);
+      channel.release();
+    }
+  }
+});
+
+test('inline channel: transcript byte bound is checked before pasting on both delivery paths', () => {
+  for (const acknowledged of [false, true]) {
+    const receipts: Uint8Array[] = [], f = channelFixture(acknowledged ? {
+      writeAcknowledged: bytes => {receipts.push(bytes); return true;}
+    } : {}), channel = f.make(), results: string[] = [];
+    channel.claim();
+    channel.deliver('é'.repeat(16385), result => results.push(result.kind), () => true);
+    assert.deepEqual(results, ['refused']); assert.equal(f.counts().pasteCalls, 0);
+    assert.deepEqual(f.controls, []); assert.deepEqual(f.frames, []); assert.equal(receipts.length, 0);
+    channel.release();
+
+    const exact = f.make(), outcome: string[] = [];
+    exact.claim(); exact.deliver('é'.repeat(16384), result => outcome.push(result.kind), () => true);
+    assert.equal(acknowledged ? receipts.length : f.frames.length, 1);
+    assert.equal(acknowledged ? receipts[0]!.byteLength : encode(f.frames[0]!).byteLength, 32780);
+    if (!acknowledged) assert.deepEqual(outcome, ['paste']);
+    exact.release();
+  }
+});
+
+test('inline channel: original binding and guard are checked again after reentrant H', () => {
+  for (const revoke of ['mode', 'revision', 'target', 'guard'] as const) {
+    const f = channelFixture(), channel = f.make(), results: string[] = [];
+    const control = f.transport.control;
+    let allowed = true;
+    f.transport.control = (id, dirty) => {
+      control(id, dirty);
+      if (revoke === 'mode') f.mode.value = false;
+      if (revoke === 'revision') f.scope.mutate();
+      if (revoke === 'target') f.close();
+      if (revoke === 'guard') allowed = false;
+    };
+    channel.claim(); channel.deliver('safe', result => results.push(result.kind), () => allowed);
+    assert.deepEqual(results, ['refused'], revoke);
+    assert.deepEqual(f.frames, [], revoke); channel.release();
   }
 });

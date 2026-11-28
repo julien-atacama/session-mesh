@@ -72,7 +72,7 @@ function createNativeInsertionChannel(p: OriginalChannelPorts, resources: Channe
 interface InsertionPaste {
   text: string; done(result: PasteResult): void; guard(): boolean;
   settled: boolean; attempted: boolean; frames: number; wireBytes: number;
-  expected: string; offset: number; stopped: boolean; failure: PasteResult['reason'];
+  expected: string; bytes: Uint8Array; offset: number; stopped: boolean; failure: PasteResult['reason'];
 }
 
 class NativeInsertionChannel implements DictationChannel {
@@ -104,13 +104,20 @@ class NativeInsertionChannel implements DictationChannel {
     this.released = true; this.onFrame = null; this.resources.release();
   }
   deliver(text: string, done: (result: PasteResult) => void, guard: () => boolean): void {
+    const requestedBytes = new TextEncoder().encode(text).byteLength;
+    const expected = '\x1b[200~' + text.replace(/\n/g, '\r') + '\x1b[201~';
+    const bytes = new TextEncoder().encode(expected);
     const paste: InsertionPaste = {text, done, guard, settled: false, attempted: false, frames: 0, wireBytes: 0,
-      expected: '\x1b[200~' + text.replace(/\n/g, '\r') + '\x1b[201~', offset: 0, stopped: false, failure: null};
+      expected, bytes, offset: 0, stopped: false, failure: null};
     if (this.used) {this.finish(paste, 'refused', 'guard'); return;}
     this.used = true;
     // LF/tab are data inside framing; CR must already have been normalized
     // upstream. Never let ESC or other C0/C1 controls terminate that framing.
-    if (!text || hasDictationControls(text)) {this.finish(paste, 'refused', 'incomplete'); return;}
+    // The worker accepts at most 32768 transcript bytes; the WS frame is at
+    // most 4 MiB. Refuse before invoking an encoder that might stream output.
+    if (!text || requestedBytes > 32768 || bytes.byteLength > 4 * 1024 * 1024 || hasDictationControls(text)) {
+      this.finish(paste, 'refused', 'incomplete'); return;
+    }
     prepareEncoder({encoder: this.resources.encoder, mode: () => this.p.mode.value,
       valid: () => this.allowed(paste), refused: () => this.refuse(paste, 'guard'), ready: () => this.paste(paste)});
   }
@@ -136,26 +143,34 @@ class NativeInsertionChannel implements DictationChannel {
     if (paste.stopped) {this.refuse(paste, paste.failure); return;}
     if (paste.offset !== paste.expected.length) {this.refuse(paste, 'incomplete'); return;}
     if (!this.allowed(paste)) {this.refuse(paste, 'guard'); return;}
-    if (!this.p.writeAcknowledged) {this.finish(paste, 'paste', null); return;}
-    const p = this.p, bytes = new TextEncoder().encode(paste.expected), revision = p.lease.revision;
-    let queued = false;
+    const p = this.p, revision = p.lease.revision;
+    let queued = false, delivered = false;
     try {
-      this.native!.write(bytes, false, {
+      delivered = this.native!.write(paste.bytes, false, {
         control: (id, dirty) => p.transport.control(id, dirty),
         data: payload => {
           if (this.released || !p.mode.valid || !p.mode.value || !p.valid() || !paste.guard() ||
-              !p.lease.canInsert() || p.lease.revision !== revision + 1) throw Error('insertion guard revoked');
+              !p.lease.canInsert() || p.lease.revision !== revision + 1) {
+            paste.failure = 'guard'; throw Error('insertion guard revoked');
+          }
           paste.attempted = true;
-          queued = p.writeAcknowledged!(payload, false, accepted => {
-            if (this.released) return;
-            if (accepted) this.finish(paste, 'paste', null);
-            else this.refuse(paste, 'send');
-          });
-          if (!queued) {paste.attempted = false; throw Error('acknowledged input unavailable');}
+          paste.frames = 1; paste.wireBytes = payload.byteLength;
+          if (p.writeAcknowledged) {
+            queued = p.writeAcknowledged(payload, false, accepted => {
+              if (this.released) return;
+              if (accepted) this.finish(paste, 'paste', null);
+              else this.refuse(paste, 'send');
+            });
+            if (!queued && !paste.settled) {paste.attempted = false; paste.frames = 0; paste.wireBytes = 0;}
+          } else {
+            p.transport.data(payload);
+            queued = true;
+          }
         },
       });
-    } catch { /* A rejected write must never fall back to an unacknowledged send. */ }
-    if (!queued) this.refuse(paste, 'send');
+    } catch { /* An uncertain send must never fall back to another write. */ }
+    if (!delivered || !queued) this.refuse(paste, paste.failure ?? 'send');
+    else if (!p.writeAcknowledged) this.finish(paste, 'paste', null);
   }
   private frame(paste: InsertionPaste, frame: string): void {
     if (paste.stopped || paste.settled) return;
@@ -163,27 +178,6 @@ class NativeInsertionChannel implements DictationChannel {
     if (!frame || !paste.expected.startsWith(frame, paste.offset)) {
       paste.stopped = true; paste.failure = 'incomplete'; return;
     }
-    const p = this.p, bytes = new TextEncoder().encode(frame), revision = p.lease.revision;
-    if (p.writeAcknowledged) {
-      paste.frames++; paste.wireBytes += bytes.byteLength; paste.offset += frame.length;
-      return;
-    }
-    try {
-      // A paste never completes H ownership, even for a frame containing only CR.
-      const delivered = this.native!.write(bytes, false, {
-        control: (id, dirty) => p.transport.control(id, dirty),
-        data: payload => {
-          // H can reenter application code. At the actual D boundary allow
-          // exactly our write's one revision increment.
-          if (this.released || !p.mode.valid || !p.mode.value || !p.valid() || !paste.guard()
-            || !p.lease.canInsert() || p.lease.revision !== revision + 1) {
-            paste.failure = 'guard'; throw Error('insertion guard revoked');
-          }
-          paste.attempted = true; p.transport.data(payload);
-        },
-      });
-      if (!delivered) {paste.stopped = true; paste.failure ??= 'send'; return;}
-    } catch {paste.stopped = true; paste.failure = 'send'; return;}
-    paste.frames++; paste.wireBytes += bytes.byteLength; paste.offset += frame.length;
+    paste.offset += frame.length;
   }
 }
