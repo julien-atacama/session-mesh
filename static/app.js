@@ -561,7 +561,10 @@ function openLocalTerminal(name, size, observer, inputBinding = null) {
       let message;
       try { message = JSON.parse(event.data); } catch {}
       if (message?.t === "input_capability") { if (current()) observer.inputCapability?.(handle, message); return; }
-      if (message?.t === "input_ack") { if (current()) observer.inputAck?.(handle, message); return; }
+      if (message?.t === "input_ack") {
+        if (current() || observer.retainedInput?.(handle)) observer.inputAck?.(handle, message);
+        return;
+      }
       if (message?.t === "input_rejected") { if (current()) observer.inputRejected?.(handle); return; }
     }
     binding.receive(event.data);
@@ -569,6 +572,7 @@ function openLocalTerminal(name, size, observer, inputBinding = null) {
   socket.onclose = (event) => {
     if (event?.code === 1012) inventoryPoller?.noteRestart();   // the server closes its sockets as it restarts
     const notify = current();
+    observer.abandonRetainedInput?.(handle);
     lifetime.dispose();
     if (notify) return observer.closed(handle);
   };
@@ -2831,12 +2835,21 @@ class Pane {
       }
       const current = (terminal) => !c.closed && this.conn === c && c.terminal === terminal;
       const version = this.inputAck?.version ?? 0;
+      const socketInput = this.inputAck, socketLease = this.inputLease;
+      socketInput?.retainedConnection?.forgetRetainedInput?.();
       const knownBinding = version === 2 ? this.inputAck.binding : null;
       c.v2AwaitingCapability = version === 2;
       let openedThisAttempt = false;
       const terminal = openLocalTerminal(name, { ...this.ownSize(), created: c.created }, {
         modeSource: this.term,
         current,
+        retainedInput: (handle) => socketInput?.retainedConnection === c && c.terminal === handle,
+        abandonRetainedInput: (handle) => {
+          if (socketInput?.retainedConnection === c && c.terminal === handle) {
+            c.forgetRetainedInput?.();
+            socketInput.disconnect();
+          }
+        },
         inputCapability: (_terminal, message) => {
           if (version === 2) {
             const valid = message.version === 2 && message.supported === true &&
@@ -2868,26 +2881,28 @@ class Pane {
           this.renderRetainedInput();
         },
         inputAck: (_terminal, message) => {
+          const ackInput = socketInput;
+          const ackLease = socketLease;
           if (version === 2) {
             if (message.version !== 2 || typeof message.input_ack !== "boolean" ||
                 !Number.isSafeInteger(message.seq)) {
               c.v2Refused = true;
-              this.inputAck?.reject();
+              ackInput?.reject();
               _terminal.socket.close();
-            } else this.inputAck?.ackV2(message.created, message.slot, message.generation,
+            } else ackInput?.ackV2(message.created, message.slot, message.generation,
               message.seq, message.input_ack, message.reason);
-            if (this.inputAck?.completed && this.inputAck.pendingHumanBytes === 0)
-              this.inputLease?.release();
+            if (ackInput?.completed && ackInput.pendingHumanBytes === 0)
+              ackLease?.release();
             this.renderRetainedInput();
             return;
           }
           if (typeof message.input_ack !== "boolean" || !Number.isSafeInteger(message.seq)) {
-            this.inputAck?.disconnect();
+            ackInput?.disconnect();
             return;
           }
-          this.inputAck?.ack(message.created, message.id, message.seq, message.input_ack, message.reason);
-          if (this.inputAck?.completed && this.inputAck.pendingHumanBytes === 0)
-            this.inputLease?.release();
+          ackInput?.ack(message.created, message.id, message.seq, message.input_ack, message.reason);
+          if (ackInput?.completed && ackInput.pendingHumanBytes === 0)
+            ackLease?.release();
           this.renderRetainedInput();
         },
         inputRejected: (terminal) => {
@@ -2966,6 +2981,7 @@ class Pane {
           if (c.inlineMode !== nativeMode) {c.inlineMode = nativeMode; renderInlineDictation();}
         },
         closed: async (terminal) => {
+          c.forgetRetainedInput?.();
           clearTimeout(c.v2AwaitTimer);
           // Settle only this socket's replay queue before the inventory refresh
           // yields; a replacement socket owns a different queue.
@@ -2978,7 +2994,7 @@ class Pane {
             c.v2Refused = true;
             this.inputAck?.reject();
           }
-          this.inputAck?.disconnect();
+          socketInput?.disconnect();
           this.renderRetainedInput();
           this.leaveReplayGeometry(c);
           if (lineDirect?.conn === c) endDirectLine("line.directConnection");
@@ -3059,7 +3075,7 @@ class Pane {
     this.cancelReplayInput(this.conn);
     this.dropReaderAnchor(this.conn);
     this.conn.closed = true;
-    this.inputAck?.disconnect();
+    if (this.inputAck?.retainedConnection !== this.conn) this.inputAck?.disconnect();
     if (this.conn.autoRedraw) clearTimeout(this.conn.autoRedraw.timer);
     if (this.conn.initialFollow) clearTimeout(this.conn.initialFollow.timer);
     if (this.conn.followFrame) cancelAnimationFrame(this.conn.followFrame);
@@ -8324,16 +8340,28 @@ function retainInlineChannel(session) {
       pane.conn !== connection || pane.inputLease !== lease)) return null;
   const target = paneTargets.capture(pane);
   if (!target) return null;
-  let releaseTerminal = null, released = false;
+  let releaseTerminal = null, releaseInput = null, released = false;
   const releaseTarget = () => {
     if (released) return;
     released = true;
-    try {paneTargets.release(target);} finally {releaseTerminal?.();}
+    try {paneTargets.release(target);}
+    finally { try {releaseInput?.();} finally {releaseTerminal?.();} }
   };
   try {
     releaseTerminal = terminal.retain();
     if (!releaseTerminal) {releaseTarget(); return null;}
     if (touch) return retainInlinePhonePrompt(context, releaseTarget);
+    if (inputAck) {
+      if (inputAck.retainedConnection) {releaseTarget(); return null;}
+      inputAck.retainedConnection = connection;
+      releaseInput = () => {
+        if (inputAck.retainedConnection !== connection || connection.forgetRetainedInput !== releaseInput) return;
+        inputAck.retainedConnection = null;
+        connection.forgetRetainedInput = null;
+        if (connection.closed) inputAck.disconnect();
+      };
+      connection.forgetRetainedInput = releaseInput;
+    }
     return MeshPaneActions.createDictationChannel({
       target, socket: connection.ws, lease, encoder: createDictationEncoder, mode: terminal.dictationMode,
       insertionOnly: true,
@@ -8341,10 +8369,9 @@ function retainInlineChannel(session) {
       release: releaseTarget,
       transport: {control: (id, dirty) => terminal.lease(id, dirty), data: bytes => terminal.queueInput(bytes)},
       writeAcknowledged: inputAck ? (bytes, complete, settled) =>
-        pane.conn === connection && pane.inputAck === inputAck && pane.inputLease === lease &&
-        connection.terminal === terminal && !connection.v2AwaitingCapability &&
+        inputAck.retainedConnection === connection && connection.terminal === terminal && !connection.v2AwaitingCapability &&
         terminal.isBound(context.name, context.created) &&
-        inputAck.writeTracked(bytes, complete, settled) : undefined,
+        inputAck.writeTracked(bytes, complete, settled, frame => terminal.acknowledgedInput(frame)) : undefined,
     });
   } catch (error) {releaseTarget(); throw error;}
 }

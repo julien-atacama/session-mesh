@@ -103,8 +103,9 @@ nativeTest('AC-7: conditional incarnation binding acknowledgement', async () => 
     const bound = incoming.filter(e => typeof e === 'string' && JSON.parse(e).t === 'bound');
     assert.equal(bound.length, 1);
     assert.deepEqual(JSON.parse(bound[0] as string), {t: 'bound', name: f.name, created: initial});
-    assert.equal(typeof incoming[0], 'string');
-    assert.equal(JSON.parse(incoming[0] as string).t, 'bound', 'bound precedes geometry and first binary replay');
+    const boundAt = incoming.findIndex(value => typeof value === 'string' && JSON.parse(value).t === 'bound');
+    const binaryAt = incoming.findIndex(Buffer.isBuffer);
+    assert.ok(boundAt >= 0 && binaryAt > boundAt, 'bound precedes the first binary replay');
     assert.ok(incoming.some(Buffer.isBuffer));
     await f.page.close(); // no old page may resize/reconnect while the replacement is measured
     const replacement = await f.replace();

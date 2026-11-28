@@ -240,7 +240,7 @@ test('old closed callback cannot cancel a replacement queue after awaited invent
   const f = fixture(), c = f.pane.conn;
   f.deliver();
   let release!: () => void;
-  Object.assign(f.context, {c, name: 'A', version: 0, openedThisAttempt: false, clearTimeout() {}, lineDirect: null, data: {mesh: []}, t: (key: string) => key,
+  Object.assign(f.context, {c, name: 'A', version: 0, socketInput: null, openedThisAttempt: false, clearTimeout() {}, lineDirect: null, data: {mesh: []}, t: (key: string) => key,
     refresh: () => new Promise<void>(resolve => {release = resolve;}),
     current: (terminal: any) => f.pane.conn === c && c.terminal === terminal && !c.closed});
   f.pane.leaveReplayGeometry = () => {};
@@ -371,13 +371,15 @@ for (const touch of [false, true]) test(`${touch ? 'phone' : 'native'} app chann
   assert.doesNotThrow(() => channel.release()); assert.doesNotThrow(() => channel.release());
   assert.deepEqual(f.counts, {target: 1, terminal: 1, lease: 1});
 });
-test('retained ACK dictation refuses a changed connection after A to B to A selection', () => {
+test('retained ACK dictation keeps original A actor across A to B to A, never the replacement', () => {
   const f = channelSetupFixture(false, ''), c = f.context.inlineContexts.get(f.session);
   c.name = 'A'; c.created = 1;
   const original = c.connection, pane = c.pane;
   original.name = 'A'; original.created = 1; original.terminal.isBound = () => true;
   let writes = 0;
-  const input = {writeTracked: () => {writes++; return true;}};
+  let sender: ((frame: Uint8Array) => void) | undefined;
+  const input = {writeTracked: (_bytes: Uint8Array, _complete: boolean, _settle: Function,
+    send: (frame: Uint8Array) => void) => {writes++; sender = send; return true;}};
   pane.inputAck = input;
   pane.inputAcks = new Map([['A\0' + 1, {input}]]);
   f.context.MeshPaneActions.createDictationChannel = (ports: any) => ports;
@@ -385,12 +387,18 @@ test('retained ACK dictation refuses a changed connection after A to B to A sele
   const settled = () => {};
   assert.equal(channel.writeAcknowledged(new Uint8Array([65]), false, settled), true);
   pane.conn = {name:'B',created:1,terminal:original.terminal};
-  assert.equal(channel.writeAcknowledged(new Uint8Array([66]), false, settled), false);
+  assert.equal(channel.writeAcknowledged(new Uint8Array([66]), false, settled), true);
   pane.conn = {name:'A',created:1,terminal:original.terminal};
-  assert.equal(channel.writeAcknowledged(new Uint8Array([67]), false, settled), false,
-    'a reselected A actor is not the original connection');
-  assert.equal(writes,1);
+  assert.equal(channel.writeAcknowledged(new Uint8Array([67]), false, settled), true,
+    'only the retained original connection can carry late insertion');
+  assert.equal(writes,3);
+  let originalSends = 0, replacement = 0;
+  original.terminal.acknowledgedInput = () => originalSends++;
+  pane.conn.terminal = {acknowledgedInput: () => replacement++};
+  sender!(new Uint8Array([1, 2, 3]));
+  assert.equal(originalSends, 1); assert.equal(replacement, 0);
   channel.release();
+  assert.equal(channel.writeAcknowledged(new Uint8Array([68]), false, settled), false);
 });
 test('inline header marks recording only after permission and recorder startup', () => {
   const attributes = new Map<string,string>(), button = {setAttribute(key: string,value: string) {attributes.set(key,value);}};

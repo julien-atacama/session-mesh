@@ -331,7 +331,7 @@ export function createAcknowledgedInput(ports: {
   const maxPending = 1024 * 1024;
   const maxFrame = 65536;
   type Pending = { seq: number; data: Uint8Array; complete: boolean; reportOnly: boolean; reviewOnly: boolean;
-    settled: ((accepted: boolean) => void) | undefined };
+    settled: ((accepted: boolean) => void) | undefined; send: (payload: Uint8Array) => void };
   const pending: Pending[] = [];
   let nextSeq = 1;
   let active = false;
@@ -359,11 +359,11 @@ export function createAcknowledgedInput(ports: {
     // A failed/uncertain socket send must never allow automatic retry.
     sent = true;
     updateState("sending");
-    try { ports.send(payload); }
+    try { frame.send(payload); }
     catch { updateState("uncertain"); settleTracked(frame, false); }
   };
   const enqueue = (bytes: Uint8Array, complete: boolean, retainOnly: boolean,
-    settled?: (accepted: boolean) => void) => {
+    settled?: (accepted: boolean) => void, send = ports.send) => {
     if ((!retainOnly && (blocked || state === "halted")) || !bytes.length || bytes.length > maxPending - size() ||
         nextSeq + Math.ceil(bytes.length / maxFrame) > 0x80000000) return false;
     const reportOnly = terminalReportsOnly(bytes);
@@ -373,7 +373,7 @@ export function createAcknowledgedInput(ports: {
       const end = Math.min(bytes.length, offset + maxFrame);
       pending.push({ seq: nextSeq++, data: bytes.slice(offset, end),
         complete: complete && !reportOnly && end === bytes.length, reportOnly, reviewOnly: retainOnly,
-        settled: end === bytes.length ? settled : undefined });
+        settled: end === bytes.length ? settled : undefined, send });
     }
     completed = false;
     if (retainOnly) updateState(blocked || state === "halted" ? "halted" : sent ? "uncertain" : "review");
@@ -448,9 +448,10 @@ export function createAcknowledgedInput(ports: {
     write(bytes: Uint8Array, complete = false) {
       return enqueue(bytes, complete, false);
     },
-    writeTracked(bytes: Uint8Array, complete: boolean, settled: (accepted: boolean) => void) {
+    writeTracked(bytes: Uint8Array, complete: boolean, settled: (accepted: boolean) => void,
+      send = ports.send) {
       return active && state === "ready" && !blocked && !pending.length && bytes.length <= maxFrame &&
-        enqueue(bytes, complete, false, settled);
+        enqueue(bytes, complete, false, settled, send);
     },
     retain(bytes: Uint8Array, complete = false) { return enqueue(bytes, complete, true); },
     ack(created: number, id: string, seq: number, ok: boolean, reason?: string) {
