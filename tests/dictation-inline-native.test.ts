@@ -271,6 +271,45 @@ for (const dirty of [false, true]) nativeTest(`ACK-v2 A→B→A retains the ${di
   });
 });
 
+nativeTest('ACK-v2 reconnects the retained dirty actor in place without replaying input', async () => {
+  await withNativeEditor(async f => {
+    const b = await f.addEditor('native-B');
+    const original = f.sockets.find(s => new URL(s.url).pathname === `/ws/${f.name}`)!;
+    const originalFrames = original.sent.filter(Buffer.isBuffer).length;
+    const actor = await f.page.evaluate(() => active.inputAck.binding);
+    await record(f, 'late', {beforeResult: async () => {
+      await f.select(b.name);
+      await f.select(f.name);
+    }});
+    await expectBuffer(f, 'late');
+    await waitRetired(f);
+    await f.wait('released original socket', () => original.isClosed());
+    const opened = f.sockets.filter(s => new URL(s.url).pathname === `/ws/${f.name}`).at(-1)!;
+    assert.notEqual(opened, original);
+    const hold = original.sent.flatMap(frame => typeof frame === 'string' ? [JSON.parse(frame)] : [])
+      .findLast(frame => frame.t === 'h' && frame.dirty);
+    assert.deepEqual(hold, {t: 'h', slot: actor.slot, generation: actor.generation, dirty: true},
+      'the late hold binds the original actor, not the temporary view');
+    const resume = f.page.locator('.pane.active .p-input-other-drafts')
+      .getByRole('button', {name: 'Reconnect input', exact: true});
+    assert.equal(await resume.count(), 1, 'the same-incarnation draft offers safe reconnect');
+    await resume.click();
+    await f.wait('in-place ACK reconnect', () => f.sockets.some(s =>
+      s !== opened && s !== original && new URL(s.url).pathname === `/ws/${f.name}`));
+    await f.page.waitForFunction(({name, created}) => active.conn?.terminal?.isBound(name, created)
+      && !active.conn.v2AwaitingCapability && !active.conn.replayPending && !active.conn.replaying &&
+      !active.conn.draining, {name: f.name, created: f.created});
+    assert.deepEqual(await f.page.evaluate(() => active.inputAck.binding), actor);
+    assert.equal(opened.sent.filter(Buffer.isBuffer).length, 0);
+    const resumed = f.sockets.filter(s => new URL(s.url).pathname === `/ws/${f.name}`).at(-1)!;
+    assert.equal(resumed.sent.filter(Buffer.isBuffer).length, 0, 'reconnect does not replay the old paste');
+    await record(f, 'again'); await expectBuffer(f, 'lateagain'); await waitRetired(f);
+    assert.equal(original.sent.filter(Buffer.isBuffer).length, originalFrames + 1);
+    assert.equal(resumed.sent.filter(Buffer.isBuffer).length, 1);
+    expectNoSubmission(f);
+  });
+});
+
 nativeTest('ACK-v2 intentional retirement of retained A rejects the late line without a fallback', async () => {
   await withNativeEditor(async f => {
     const b = await f.addEditor('native-B');

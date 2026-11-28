@@ -1226,18 +1226,23 @@ class Pane {
           card.append(discard);
         }
         if (entry.lease?.dirty && !entry.input.pendingBytes) {
-          const forget = document.createElement("button");
-          forget.type = "button"; forget.className = "btn ghost sm";
-          forget.textContent = t("conn.inputForgetOldDraft");
-          forget.addEventListener("click", () => {
-            if (this.inputAcks.get(key) !== entry || entry.input.pendingBytes || !entry.lease?.dirty ||
-                !confirm(t("conn.inputForgetOldDraftConfirm"))) return;
+          const sameIncarnation = key.startsWith(`${this.conn?.name}\0${this.conn?.created}\0`);
+          const action = document.createElement("button");
+          action.type = "button"; action.className = "btn ghost sm";
+          action.textContent = t(sameIncarnation ? "conn.inputReconnect" : "conn.inputForgetOldDraft");
+          action.addEventListener("click", () => {
+            if (this.inputAcks.get(key) !== entry || entry.input.pendingBytes || !entry.lease?.dirty) return;
+            if (sameIncarnation) {
+              if (!this.reconnectRetainedInput(key, entry)) flash(t("conn.inputUnavailable"));
+              return;
+            }
+            if (!confirm(t("conn.inputForgetOldDraftConfirm"))) return;
             this.inputAcks.delete(key);
             this.inputLeases.delete(key);
             this.renderRetainedInput();
             renderReloadStatus();
           });
-          card.append(forget);
+          card.append(action);
         }
         otherContainer.append(card);
       }
@@ -1343,6 +1348,28 @@ class Pane {
           !entry.input.pendingBytes && entry.lease?.dirty) return { key, entry };
     }
     return null;
+  }
+
+  reconnectRetainedInput(key, entry) {
+    const c = this.conn, session = c && find(c.name);
+    if (!localMeshEffectsAllowed() || !c || c.closed || c.ended || !session ||
+        !rowAuthoritative(session) || session.created !== c.created || listedInputVersion(session) !== 2) return false;
+    const currentKey = `${c.name}\0${c.created}`, current = this.inputAcks.get(currentKey);
+    if (!key.startsWith(`${currentKey}\0`) || this.inputAcks.get(key) !== entry ||
+        entry.input.version !== 2 || !entry.input.binding || entry.input.blocked ||
+        entry.input.pendingBytes || !entry.lease?.dirty || entry.input.retainedConnection ||
+        entry.retainedSocket?.socket.readyState !== WebSocket.CLOSED ||
+        !current || current.input !== this.inputAck || current.lease !== this.inputLease ||
+        current.input.pendingBytes || current.input.retainedConnection || current.lease.dirty ||
+        current.lease.releasePending || current.lease.retained) return false;
+    // Resume the original native actor, not its text. The temporary view's
+    // clean actor can retire; the original dirty lease stays authoritative.
+    this.detach();
+    current.lease.retire();
+    this.inputAcks.delete(key); this.inputLeases.delete(key);
+    this.inputAcks.set(currentKey, entry); this.inputLeases.set(currentKey, entry.lease);
+    this.attach(c.name, {focusTerminal: true});
+    return true;
   }
 
   inputLeaseFor(name) {
@@ -3063,7 +3090,7 @@ class Pane {
       }, version === 2 ? {
         version: 2, mode: knownBinding ? "resume" : "new", created: c.created,
         slot: knownBinding?.slot, generation: knownBinding?.generation, actorNonce: knownBinding?.actorNonce,
-        current: () => c.v2AwaitingCapability ? null : this.inputAck?.binding,
+        current: () => c.v2AwaitingCapability ? null : socketInput?.binding,
       } : this.inputAck ? this.inputAcks.get(`${name}\0${c.created}`) && {
         version: 1, id: this.inputAcks.get(`${name}\0${c.created}`).id, created: c.created,
       } : null);
