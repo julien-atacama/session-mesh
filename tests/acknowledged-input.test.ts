@@ -114,14 +114,14 @@ for (const version of [1, 2] as const) {
   });
   test(`v${version} throwing and reentrant callbacks cannot strand an ACK or bypass cancellation`, () => {
     const frames: Uint8Array[] = [], id = 'actor', nonce = 'b'.repeat(32);
-    let throwState = false, callbacks = 0;
+    const receipts: boolean[] = [];
+    let throwState = false, discarded = false;
     const input = createAcknowledgedInput({version, attachmentId: id, created: 42,
       send: frame => frames.push(frame), state: () => {if (throwState) throw Error('render failed');}});
     if (version === 1) input.connect(42, id, true);
     else input.connectV2(42, 1, 1, nonce, true);
     assert.equal(input.writeTracked(bytes('paste'), false, accepted => {
-      callbacks++;
-      assert.equal(accepted, true);
+      receipts.push(accepted);
       throw Error('composer failed');
     }), true);
     throwState = true;
@@ -129,17 +129,17 @@ for (const version of [1, 2] as const) {
     else input.ackV2(42, 1, 1, 1, true);
     assert.equal(input.state, 'ready');
     assert.equal(input.pendingBytes, 0);
-    assert.equal(callbacks, 1);
+    assert.deepEqual(receipts, [true]);
     assert.equal(input.writeTracked(bytes('second'), false, accepted => {
-      callbacks++;
-      assert.equal(accepted, false);
-      assert.equal(input.discard(), true);
+      receipts.push(accepted);
+      discarded = input.discard();
       throw Error('cancel failed');
     }), true);
     input.disconnect();
     assert.equal(input.state, 'halted');
     assert.equal(input.pendingBytes, 0);
-    assert.equal(callbacks, 2);
+    assert.deepEqual(receipts, [true, false]);
+    assert.equal(discarded, true);
     assert.equal(frames.length, 2);
   });
   test(`v${version} state callback cancelling a send prevents stale transmission`, () => {
