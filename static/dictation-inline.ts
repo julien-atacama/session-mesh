@@ -47,6 +47,9 @@ interface Details {
   cleanup: Promise<boolean> | null; cleanupMode: 'inserted' | 'cancel' | null;
 }
 const CLEANUP_MS = 30000;
+// Leave time for a status check and another control request, while allowing
+// the relay's two-second authority check and normal round-trip latency.
+const CLEANUP_REQUEST_MS = 5000;
 const ABANDONED_CANCEL_MS = 5000;
 const validText = (value: unknown): value is string => typeof value === 'string' && !!value.trim()
   && value.length <= 32768 && !hasDictationControls(value);
@@ -428,7 +431,7 @@ export class InlineDictationController {
         const path = known ? `/api/transcribe/${known}${control ? `/${action}` : ''}` : `/api/transcribe/request/${s.requestId}`;
         const {response, value} = await this.read(path, control ? {method: 'POST',
           headers: {...this.headers(), 'Content-Type': 'application/json'}, body: JSON.stringify(action === 'settle' ? {outcome: 'inserted'} : {})}
-          : {headers: this.headers(), cache: 'no-store'}, deadline, s);
+          : {headers: this.headers(), cache: 'no-store'}, Math.min(deadline, this.p.now() + CLEANUP_REQUEST_MS), s);
         if (!this.current(s, generation)) return false;
         if (known && response.status === 404) return complete();
         if (!response.ok) {this.serviceFailure(response, value); throw Error('unconfirmed');}

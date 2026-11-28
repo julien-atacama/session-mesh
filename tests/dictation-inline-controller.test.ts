@@ -148,6 +148,42 @@ test('AC-5: inserted settlement and bounded cleanup', async t => {
     const count = f.calls.length; await f.advance(60000); assert.equal(f.calls.length, count);
     f.controller.dispose();
   });
+  await t.test('a hung status body leaves time to retry the exact inserted settlement', async () => {
+    const f = fixture(), base = f.defaultRequest, body = deferred<unknown>();
+    let settles = 0, statusSignal: AbortSignal | null = null;
+    f.setRequest(async (path, init) => {
+      if (path.endsWith('/settle')) {
+        if (++settles === 1) throw Error('uncertain settlement');
+        return new Promise<Response>((resolve, reject) => {
+          f.ports.schedule(() => {void base(path, init).then(resolve, reject);}, 2400);
+        });
+      }
+      if (settles && path.includes('/job-') && !path.endsWith('/settle')) {
+        statusSignal = init.signal!;
+        const r = response({}); r.json = () => body.promise; return r;
+      }
+      return base(path, init);
+    });
+    await f.controller.start(); await record(f);
+    const job = f.job()!, path = `/api/transcribe/${job.job_id}`;
+    await f.advance(10000);
+    assert.deepEqual(f.calls.filter(c => c.path.startsWith(path)).slice(1)
+      .map(c => [c.path, c.init.method || 'GET']), [
+      [`${path}/settle`, 'POST'], [path, 'GET'], [`${path}/settle`, 'POST'],
+    ]);
+    assert.equal(statusSignal?.aborted, true);
+    assert.equal(settles, 2);
+    assert.ok(f.calls.filter(c => c.path.endsWith('/settle'))
+      .every(c => JSON.parse(c.init.body as string).outcome === 'inserted'));
+    assert.equal(f.calls.filter(c => c.path.endsWith('/cancel')).length, 0);
+    assert.equal(f.session.state, 'idle'); assert.equal(f.session.outstanding, false);
+    assert.equal(f.counts().inserted, 1); assert.deepEqual(f.pastes, ['bonjour A']);
+    assert.equal(f.calls.filter(c => c.path === '/api/transcribe').length, 1);
+    const count = f.calls.length; await f.advance(60000); assert.equal(f.calls.length, count);
+    body.resolve(job); await flush();
+    assert.equal(f.session.job, null); assert.equal(f.session.requestId, null);
+    f.controller.dispose();
+  });
   await t.test('hung cleanup is aborted at 30s even if request ignores abort; late response is inert', async () => {
     const f = fixture(); const base = f.defaultRequest, pending = deferred<Response>(); let signal: AbortSignal | null | undefined;
     f.setRequest(async (path, init) => {
