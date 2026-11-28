@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
-import {createHumanInputLease, createHumanInputScope, type HumanInputScope, type HumanInputTransport} from '../static/pane-actions.ts';
+import {createAcknowledgedInput, createHumanInputLease, createHumanInputScope, type HumanInputScope, type HumanInputTransport} from '../static/pane-actions.ts';
 import {createDictationChannel} from '../static/dictation-channel.ts';
 
 const encode = (text: string): Uint8Array => new TextEncoder().encode(text);
@@ -73,6 +73,7 @@ export function assertOwnPendingInputGuards(): void {
 test('inline input: own pending input and foreign lease guards', assertOwnPendingInputGuards);
 
 function channelFixture(options: {scope?: HumanInputScope; insertionOnly?: boolean; held?: boolean;
+  canWriteAcknowledged?: (bytes: Uint8Array) => boolean;
   writeAcknowledged?: (bytes: Uint8Array, complete: boolean, settled: (accepted: boolean) => void) => boolean} = {}) {
   const f = input(options.scope), mode = {value: true, valid: true, bytes() {}, dispose() {this.valid = false;}};
   const callbacks: (() => void)[] = [], seeds: string[] = [];
@@ -87,12 +88,82 @@ function channelFixture(options: {scope?: HumanInputScope; insertionOnly?: boole
     view: 1, kind: 'mesh' as const, available: true, activeSensitive: false};
   const make = () => createDictationChannel({target, socket, lease: f.lease, encoder: () => encoder,
     valid: () => live, release: () => releases++, transport: f.transport, mode,
+    canWriteAcknowledged: options.canWriteAcknowledged,
     writeAcknowledged: options.writeAcknowledged,
     insertionOnly: options.insertionOnly ?? true});
   return {...f, mode, callbacks, seeds, make, emit: (frame: string) => listener(frame),
     setPaste: (callback: (text: string) => void) => {paste = callback;},
     close: () => {live = false;}, counts: () => ({pasteCalls, releases})};
 }
+test('inline channel: occupied ACK actor refuses before touching a clean lease; report still settles', () => {
+  for (const version of [1, 2] as const) for (const initiallyDirty of [false, true]) {
+    const frames: Uint8Array[] = [], outcomes: string[] = [];
+    const actor = createAcknowledgedInput({version, created: 1, attachmentId: 'actor',
+      send: frame => frames.push(frame), state: () => {}});
+    if (version === 1) actor.connect(1, 'actor', true);
+    else actor.connectV2(1, 1, 1, 'a'.repeat(32), true);
+    assert.equal(actor.write(encode('\x1b[1;1R')), true);
+    assert.equal(actor.state, 'sending');
+    const f = channelFixture({canWriteAcknowledged: bytes => actor.canWriteTracked(bytes),
+      writeAcknowledged: (bytes, complete, settled) => actor.writeTracked(bytes, complete, settled)});
+    if (initiallyDirty) f.lease.write(encode('earlier human draft'));
+    const controls = f.controls.length, humanFrames = f.frames.length;
+    const channel = f.make(); assert.equal(channel.claim(), true);
+    channel.deliver('draft', result => outcomes.push(result.kind), () => true);
+    assert.deepEqual(outcomes, ['refused']);
+    assert.deepEqual(f.controls.slice(controls), [], 'no speculative H for the unavailable actor');
+    assert.equal(f.lease.dirty, initiallyDirty, 'never clean a pre-existing human draft');
+    assert.equal(f.lease.inputDirty, initiallyDirty);
+    assert.equal(f.frames.length, humanFrames);
+    assert.equal(frames.length, 1, 'the report remains the only sent frame');
+    if (version === 1) actor.ack(1, 'actor', 1, true);
+    else actor.ackV2(1, 1, 1, 1, true);
+    assert.equal(actor.state, 'ready');
+    assert.equal(actor.pendingBytes, 0);
+    assert.deepEqual(outcomes, ['refused'], 'the rejected draft never replays');
+    channel.release();
+  }
+});
+test('inline channel: report starts during H; only the unsent clean claim may be released', () => {
+  const frames: Uint8Array[] = [], results: string[] = [];
+  const actor = createAcknowledgedInput({version: 2, created: 1, send: frame => frames.push(frame), state: () => {}});
+  actor.connectV2(1, 1, 1, 'a'.repeat(32), true);
+  const f = channelFixture({canWriteAcknowledged: bytes => actor.canWriteTracked(bytes),
+    writeAcknowledged: (bytes, complete, settled) => actor.writeTracked(bytes, complete, settled)});
+  const channel = f.make();
+  assert.equal(channel.claim(), true);
+  const control = f.transport.control;
+  f.transport.control = (id, dirty) => {
+    control(id, dirty);
+    if (dirty) actor.write(encode('\x1b[1;1R'));
+  };
+  channel.deliver('draft', result => results.push(result.kind), () => true);
+  assert.deepEqual(results, ['refused']);
+  assert.equal(frames.length, 1, 'the report is the only ACK frame');
+  assert.deepEqual(f.controls, [true, false], 'cancel only our clean, unsent H');
+  assert.equal(f.lease.dirty, false);
+  actor.ackV2(1, 1, 1, 1, true);
+  assert.equal(actor.state, 'ready'); assert.equal(actor.pendingBytes, 0);
+  channel.release();
+});
+test('inline channel: a refused ACK write rolls back H on the captured transport only', () => {
+  const f = channelFixture({canWriteAcknowledged: () => true, writeAcknowledged: () => false});
+  const replacement = input(), outcomes: string[] = [], control = f.transport.control;
+  f.transport.control = (id, dirty) => {
+    control(id, dirty);
+    if (dirty) f.lease.bind(replacement.transport);
+  };
+  const channel = f.make();
+  assert.equal(channel.claim(), true);
+  channel.deliver('draft', result => outcomes.push(result.kind), () => true);
+  assert.deepEqual(outcomes, ['refused']);
+  assert.deepEqual(f.controls, [true, false]);
+  assert.deepEqual(replacement.controls, [], 'the rollback never uses the replacement transport');
+  assert.equal(f.lease.dirty, false);
+  assert.deepEqual(f.frames, []);
+  assert.deepEqual(replacement.frames, []);
+  channel.release();
+});
 test('inline channel waits for the original native ACK and never falls back to untracked input', () => {
   for(const accepted of [true,false]) {
     const frames: Uint8Array[] = [], results: string[] = [];

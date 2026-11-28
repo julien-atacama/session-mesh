@@ -11,7 +11,11 @@ import {
   nativeTest, withNativeEditor, record, expectBuffer, expectNoSubmission, expectPaste,
   expectDirtyWithoutClean, pasteSocket, manualKey, typeNative, waitRetired, waitMode,
 } from '../checks/dictation-inline-native-fixture.ts';
-declare const active: {term: {rows: number; cols: number}}, inlineDictation: any;
+declare const active: {term: {rows: number; cols: number}; inputLease: {dirty: boolean};
+  inputAck: {state: string; pendingBytes: number}}, inlineDictation: any;
+declare const inlineContexts: WeakMap<object, object>;
+declare function inlineContext(pane: object): object;
+declare function retainInlineChannel(session: object): any;
 
 async function componentChecks(file: string, pattern: string, expected: number): Promise<void> {
   const env = {...process.env};
@@ -278,6 +282,45 @@ for (const dirty of [false, true]) nativeTest(`ACK-v2 A→B→A retains the ${di
     assert.equal(originalSocket.sent.filter(Buffer.isBuffer).length, originalFrameCount + 1,
       'a new A capture cannot replay on the old socket');
     expectNoSubmission(f);
+  });
+});
+
+nativeTest('ACK-v2 occupied terminal report refuses before H and settles its receipt', async () => {
+  await withNativeEditor(async f => {
+    const socket = f.sockets.find(s => new URL(s.url).pathname === `/ws/${f.name}`)!;
+    const before = socket.sent.length;
+    const result = await f.page.evaluate(({name, created}) => {
+      const pane = active as any, session = inlineDictation.session(name, created);
+      inlineContexts.set(session, inlineContext(pane));
+      const channel = retainInlineChannel(session);
+      if (!channel?.claim()) throw Error('bound native channel did not claim');
+      (window as any).heldChannel = channel;
+      const actor = pane.inputAck, original = actor.ackV2.bind(actor);
+      (window as any).heldReportAcks = [];
+      actor.ackV2 = (...args: unknown[]) => (window as any).heldReportAcks.push(args);
+      (window as any).releaseReportAcks = () => {
+        actor.ackV2 = original;
+        for (const args of (window as any).heldReportAcks.splice(0)) original(...args);
+      };
+      if (!pane.inputAck.write(new TextEncoder().encode('\x1b[1;1R'))) throw Error('report did not enter actor');
+      (window as any).reportOutcome = '';
+      channel.deliver('must not insert', (value: {kind: string}) => {(window as any).reportOutcome = value.kind;}, () => true);
+      return {state: pane.inputAck.state, dirty: pane.inputLease.dirty};
+    }, {name: f.name, created: f.created});
+    assert.deepEqual(result, {state: 'sending', dirty: false});
+    await f.page.waitForFunction(() => (window as any).reportOutcome === 'refused' &&
+      (window as any).heldReportAcks.length > 0);
+    assert.equal(await f.page.evaluate(() => active.inputLease.dirty), false);
+    await f.page.evaluate(() => (window as any).releaseReportAcks());
+    await f.page.waitForFunction(() => active.inputAck.state === 'ready' && active.inputAck.pendingBytes === 0);
+    assert.equal(await f.page.evaluate(() => active.inputLease.dirty), false);
+    assert.deepEqual(socket.sent.slice(before).filter(frame => typeof frame === 'string' &&
+      JSON.parse(frame).t === 'h'), [], 'unavailable tracked insertion sends no H');
+    assert.deepEqual(socket.sent.slice(before).filter(Buffer.isBuffer).length, 1, 'only the report sends D');
+    assert.deepEqual(socket.sent.slice(before).filter(Buffer.isBuffer)[0]!.subarray(4), Buffer.from('\x1b[1;1R'));
+    expectNoSubmission(f);
+    await f.page.evaluate(() => (window as any).heldChannel.release());
+    assert.equal(await f.page.evaluate(() => active.inputLease.dirty), false, 'release cannot create a reload hold');
   });
 });
 

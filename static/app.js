@@ -8421,15 +8421,17 @@ function retainInlineChannel(session) {
       };
       connection.forgetRetainedInput = releaseInput;
     }
+    const ackBound = () => inputAck?.retainedConnection === connection &&
+      connection.terminal === terminal && !connection.v2AwaitingCapability &&
+      terminal.isBound(context.name, context.created);
     return MeshPaneActions.createDictationChannel({
       target, socket: connection.ws, lease, encoder: createDictationEncoder, mode: terminal.dictationMode,
       insertionOnly: true,
       valid: () => !inlineContextReason(context),
       release: releaseTarget,
       transport: {control: (id, dirty) => terminal.lease(id, dirty), data: bytes => terminal.queueInput(bytes)},
-      writeAcknowledged: inputAck ? (bytes, complete, settled) =>
-        inputAck.retainedConnection === connection && connection.terminal === terminal && !connection.v2AwaitingCapability &&
-        terminal.isBound(context.name, context.created) &&
+      canWriteAcknowledged: inputAck ? bytes => ackBound() && inputAck.canWriteTracked(bytes) : undefined,
+      writeAcknowledged: inputAck ? (bytes, complete, settled) => ackBound() &&
         inputAck.writeTracked(bytes, complete, settled, frame => terminal.acknowledgedInput(frame)) : undefined,
     });
   } catch (error) {releaseTarget(); throw error;}

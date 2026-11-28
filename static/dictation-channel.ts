@@ -22,6 +22,7 @@ interface OriginalChannelPorts {
   // Native prompt insertion only. The app must supply original-binding/replay
   // provenance through valid(); construction snapshots the input revision at hold.
   insertionOnly?: boolean;
+  canWriteAcknowledged?(bytes: Uint8Array): boolean;
   writeAcknowledged?(bytes: Uint8Array, complete: boolean, settled: (accepted: boolean) => void): boolean;
 }
 interface Preparation {
@@ -143,14 +144,19 @@ class NativeInsertionChannel implements DictationChannel {
     if (paste.stopped) {this.refuse(paste, paste.failure); return;}
     if (paste.offset !== paste.expected.length) {this.refuse(paste, 'incomplete'); return;}
     if (!this.allowed(paste)) {this.refuse(paste, 'guard'); return;}
-    const p = this.p, revision = p.lease.revision;
+    // A busy ACK actor must refuse before the lease can emit H or become dirty.
+    // The data callback still rechecks guards and writeTracked before the D attempt.
+    if (this.p.writeAcknowledged && this.p.canWriteAcknowledged &&
+        !this.p.canWriteAcknowledged(paste.bytes)) {this.refuse(paste, 'guard'); return;}
+    const p = this.p, revision = p.lease.revision, wasDirty = p.lease.dirty;
     let queued = false, delivered = false;
     try {
       delivered = this.native!.write(paste.bytes, false, {
         control: (id, dirty) => p.transport.control(id, dirty),
         data: payload => {
           if (this.released || !p.mode.valid || !p.mode.value || !p.valid() || !paste.guard() ||
-              !p.lease.canInsert() || p.lease.revision !== revision + 1) {
+              !p.lease.canInsert() || p.lease.revision !== revision + 1 ||
+              (p.writeAcknowledged && p.canWriteAcknowledged && !p.canWriteAcknowledged(payload))) {
             paste.failure = 'guard'; throw Error('insertion guard revoked');
           }
           paste.attempted = true;
@@ -169,6 +175,10 @@ class NativeInsertionChannel implements DictationChannel {
         },
       });
     } catch { /* An uncertain send must never fall back to another write. */ }
+    // Cancel this claim's H only on its original transport, when no D could
+    // have reached the socket and no human edit preceded or intervened.
+    if (!paste.attempted && !wasDirty && p.lease.dirty &&
+        p.lease.revision === revision + 1 && p.lease.canInsert()) p.lease.release(p.transport);
     if (!delivered || !queued) this.refuse(paste, paste.failure ?? 'send');
     else if (!p.writeAcknowledged) this.finish(paste, 'paste', null);
   }

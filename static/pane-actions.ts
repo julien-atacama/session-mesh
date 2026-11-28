@@ -65,7 +65,7 @@ export interface HumanInputLease {
   claimInsertion(expectedCaptureRevision: number): HumanInputAttempt | null;
   reconnect(): void;
   hold(): void;
-  release(): void;
+  release(transport?: HumanInputTransport): void;
   write(bytes: Uint8Array, complete?: boolean, transport?: HumanInputTransport): boolean;
   defer(bytes: Uint8Array, complete: boolean): DeferredHumanInput;
   atomic(bytes: Uint8Array): boolean;
@@ -226,11 +226,11 @@ class NativeInputLease implements HumanInputLease {
     this.pending = true;
     try { if (this.transport) this.set(true, this.transport, true); } catch { /* Reassert on reconnect. */ }
   }
-  release(): void {
+  release(transport = this.transport): void {
     if (this.disposed || !this.dirty) return;
     this.scope.mutate();
     this.pendingRelease = true;
-    try { if (this.transport) this.set(false, this.transport); } catch { /* Retry on reconnect. */ }
+    try { if (transport) this.set(false, transport); } catch { /* Retry on reconnect. */ }
     this.cleanup();
   }
   atomic(bytes: Uint8Array): boolean {return this.write(bytes, true);}
@@ -405,6 +405,10 @@ export function createAcknowledgedInput(ports: {
   };
   const canRetry = () => active && !!pending.length && !pending[0]?.tracked &&
     (state === "uncertain" || state === "review");
+  const canWriteTracked = (bytes: Uint8Array) =>
+    active && state === "ready" && !blocked && !pending.length &&
+    bytes.length > 0 && bytes.length <= maxFrame && bytes.length <= maxPending &&
+    nextSeq < 0x80000000;
   return {
     get version() { return ports.version ?? 1; },
     get state() { return state; },
@@ -412,6 +416,7 @@ export function createAcknowledgedInput(ports: {
     get pendingBytes() { return size(); },
     get deliveryUncertain() { return sent; },
     get canRetry() { return canRetry(); },
+    canWriteTracked,
     get incompleteHumanInput() { return incompleteHumanInput; },
     get binding() { return binding && { ...binding }; },
     get blocked() { return blocked; },
@@ -472,8 +477,7 @@ export function createAcknowledgedInput(ports: {
     },
     writeTracked(bytes: Uint8Array, complete: boolean, settled: (accepted: boolean) => void,
       send = ports.send) {
-      return active && state === "ready" && !blocked && !pending.length && bytes.length <= maxFrame &&
-        enqueue(bytes, complete, false, settled, send);
+      return canWriteTracked(bytes) && enqueue(bytes, complete, false, settled, send);
     },
     retain(bytes: Uint8Array, complete = false) { return enqueue(bytes, complete, true); },
     ack(created: number, id: string, seq: number, ok: boolean, reason?: string) {
