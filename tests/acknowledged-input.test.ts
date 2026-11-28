@@ -41,6 +41,136 @@ test('tracked dictation input aborts on lost original binding without automatic 
   assert.equal(sent.length, 1);
   assert.equal(input.writeTracked(bytes('other'), false, ok => settled.push(ok)), false);
 });
+for (const version of [1, 2] as const) {
+  test(`v${version} rejected or uncertain tracked delivery is never an ordinary retry`, () => {
+    for (const uncertainty of ['disconnect', 'unknown ACK', 'send failure', 'known refusal'] as const) {
+      const frames: Uint8Array[] = [], settled: boolean[] = [];
+      const id = 'actor', nonce = 'a'.repeat(32);
+      const input = createAcknowledgedInput({version, attachmentId: id, created: 42,
+        send: frame => {frames.push(frame); if (uncertainty === 'send failure') throw Error('uncertain send');},
+        state: () => {}});
+      const connect = () => version === 1 ? input.connect(42, id, true) : input.connectV2(42, 1, 1, nonce, true);
+      connect();
+      assert.equal(input.writeTracked(bytes('dictated'), false, ok => settled.push(ok)), true);
+      if (uncertainty === 'disconnect') {input.disconnect(); connect();}
+      if (uncertainty === 'unknown ACK') {
+        if (version === 1) input.ack(42, id, 99, true);
+        else input.ackV2(42, 1, 1, 99, true);
+      }
+      if (uncertainty === 'known refusal') {
+        if (version === 1) input.ack(42, id, 1, false, 'input_pending');
+        else input.ackV2(42, 1, 1, 1, false, 'input_pending');
+      }
+      assert.deepEqual(settled, [false], uncertainty);
+      assert.equal(input.retainedText, 'dictated');
+      assert.equal(input.canRetry, false);
+      assert.equal(input.retry(), false, `${uncertainty}: tracked data cannot be replayed`);
+      if (uncertainty === 'unknown ACK') {
+        if (version === 1) input.ack(42, id, 1, true);
+        else input.ackV2(42, 1, 1, 1, true);
+        assert.equal(input.retainedText, 'dictated', 'late ACK does not apply abandoned capture');
+        assert.deepEqual(settled, [false]);
+      }
+      assert.equal(frames.length, 1);
+      assert.equal(input.discard(), true);
+      assert.equal(input.retainedText, '');
+      assert.equal(frames.length, 1);
+    }
+  });
+  test(`v${version} tracked discard settles only after clearing the discarded frame`, () => {
+    const id = 'actor', nonce = 'e'.repeat(32);
+    const observed: unknown[] = [];
+    const input = createAcknowledgedInput({version, attachmentId: id, created: 42,
+      send: () => {}, state: () => {}});
+    if (version === 1) input.connect(42, id, true);
+    else input.connectV2(42, 1, 1, nonce, true);
+    assert.equal(input.writeTracked(bytes('discarded'), false, accepted => {
+      observed.push([accepted, input.state, input.pendingBytes]);
+    }), true);
+    assert.equal(input.discard(), true);
+    assert.deepEqual(observed, [[false, 'halted', 0]]);
+  });
+  test(`v${version} successful tracked callback can enqueue a composer CR exactly once`, () => {
+    const frames: Uint8Array[] = [], id = 'actor', nonce = 'a'.repeat(32);
+    const input = createAcknowledgedInput({version, attachmentId: id, created: 42,
+      send: frame => frames.push(frame), state: () => {}});
+    if (version === 1) input.connect(42, id, true);
+    else input.connectV2(42, 1, 1, nonce, true);
+    assert.equal(input.writeTracked(bytes('paste'), false, accepted => {
+      assert.equal(accepted, true);
+      assert.equal(input.state, 'ready');
+      assert.equal(input.write(bytes('\r'), true), true);
+    }), true);
+    if (version === 1) input.ack(42, id, 1, true);
+    else input.ackV2(42, 1, 1, 1, true);
+    assert.deepEqual(frames.map(frame => new TextDecoder().decode(frame.subarray(4))), ['paste', '\r']);
+    assert.deepEqual(frames.map(frame => new DataView(frame.buffer).getUint32(0)), [1, 2]);
+    assert.equal(input.state, 'sending');
+    if (version === 1) input.ack(42, id, 2, true);
+    else input.ackV2(42, 1, 1, 2, true);
+    assert.equal(input.state, 'ready');
+    assert.equal(input.canRetry, false);
+    assert.equal(input.pendingBytes, 0);
+  });
+  test(`v${version} throwing and reentrant callbacks cannot strand an ACK or bypass cancellation`, () => {
+    const frames: Uint8Array[] = [], id = 'actor', nonce = 'b'.repeat(32);
+    let throwState = false, callbacks = 0;
+    const input = createAcknowledgedInput({version, attachmentId: id, created: 42,
+      send: frame => frames.push(frame), state: () => {if (throwState) throw Error('render failed');}});
+    if (version === 1) input.connect(42, id, true);
+    else input.connectV2(42, 1, 1, nonce, true);
+    assert.equal(input.writeTracked(bytes('paste'), false, accepted => {
+      callbacks++;
+      assert.equal(accepted, true);
+      throw Error('composer failed');
+    }), true);
+    throwState = true;
+    if (version === 1) input.ack(42, id, 1, true);
+    else input.ackV2(42, 1, 1, 1, true);
+    assert.equal(input.state, 'ready');
+    assert.equal(input.pendingBytes, 0);
+    assert.equal(callbacks, 1);
+    assert.equal(input.writeTracked(bytes('second'), false, accepted => {
+      callbacks++;
+      assert.equal(accepted, false);
+      assert.equal(input.discard(), true);
+      throw Error('cancel failed');
+    }), true);
+    input.disconnect();
+    assert.equal(input.state, 'halted');
+    assert.equal(input.pendingBytes, 0);
+    assert.equal(callbacks, 2);
+    assert.equal(frames.length, 2);
+  });
+  test(`v${version} state callback cancelling a send prevents stale transmission`, () => {
+    const frames: Uint8Array[] = [], id = 'actor', nonce = 'c'.repeat(32);
+    let input: ReturnType<typeof createAcknowledgedInput>;
+    input = createAcknowledgedInput({version, attachmentId: id, created: 42,
+      send: frame => frames.push(frame),
+      state: state => {if (state === 'sending') input.discard();}});
+    if (version === 1) input.connect(42, id, true);
+    else input.connectV2(42, 1, 1, nonce, true);
+    assert.equal(input.write(bytes('cancelled')), true);
+    assert.equal(frames.length, 0);
+    assert.equal(input.pendingBytes, 0);
+    assert.equal(input.state, 'halted', 'cancelled send is conservatively uncertain');
+  });
+  test(`v${version} throwing tracked callback does not prevent the next queued frame`, () => {
+    const frames: Uint8Array[] = [], id = 'actor', nonce = 'd'.repeat(32);
+    const input = createAcknowledgedInput({version, attachmentId: id, created: 42,
+      send: frame => frames.push(frame), state: () => {}});
+    if (version === 1) input.connect(42, id, true);
+    else input.connectV2(42, 1, 1, nonce, true);
+    input.writeTracked(bytes('first'), false, () => {throw Error('callback failed');});
+    assert.equal(input.write(bytes('next')), true);
+    if (version === 1) input.ack(42, id, 1, true);
+    else input.ackV2(42, 1, 1, 1, true);
+    assert.deepEqual(frames.map(frame => new TextDecoder().decode(frame.subarray(4))), ['first', 'next']);
+    if (version === 1) input.ack(42, id, 2, true);
+    else input.ackV2(42, 1, 1, 2, true);
+    assert.equal(input.pendingBytes, 0);
+  });
+}
 test('locally retained input never transmits on reconnect without an explicit retry', () => {
   const frames: Uint8Array[] = [];
   const input = createAcknowledgedInput({version: 2, created: 42, send: frame => frames.push(frame), state: () => {}});
@@ -52,6 +182,7 @@ test('locally retained input never transmits on reconnect without an explicit re
   assert.equal(frames.length, 0);
   assert.equal(input.connectV2(42, 1, 1, nonce, true), true);
   assert.equal(frames.length, 0);
+  assert.equal(input.canRetry, true);
   assert.equal(input.retry(), true);
   assert.equal(frames.length, 1);
 });

@@ -629,7 +629,7 @@ class Pane {
         this.inputLeases.delete(key);
         this.attach(c.name);
         flash(t("conn.inputNewAttachment"));
-      } else if (this.inputAck) {
+      } else if (this.inputAck?.canRetry) {
         const hold = this.inputAck.version === 2 && this.inputAck.binding &&
           !this.conn?.v2AwaitingCapability && this.inputAck.pendingHumanBytes > 0 &&
           !this.inputLease?.dirty;
@@ -1328,8 +1328,7 @@ class Pane {
     retry.textContent = t(current?.state === "halted" ? "conn.inputReconnect" : "conn.inputRetry");
     retry.hidden = !current ||
       (current.version === 2 && current.blocked && current.state !== "halted") ||
-      (current.state === "halted" ? current.pendingBytes !== 0
-        : !current.pendingBytes || (current.state !== "review" && current.state !== "uncertain")) ||
+      (current.state === "halted" ? current.pendingBytes !== 0 : !current.canRetry) ||
       (!this.conn?.terminal?.isOpen() && !(current.version === 2 && current.state === "halted"));
     const state = entries.some((entry) => entry.input !== current)
       ? t("conn.inputStale")

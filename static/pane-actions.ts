@@ -331,6 +331,7 @@ export function createAcknowledgedInput(ports: {
   const maxPending = 1024 * 1024;
   const maxFrame = 65536;
   type Pending = { seq: number; data: Uint8Array; complete: boolean; reportOnly: boolean; reviewOnly: boolean;
+    tracked: boolean; unsafeTracked: boolean;
     settled: ((accepted: boolean) => void) | undefined; send: (payload: Uint8Array) => void };
   const pending: Pending[] = [];
   let nextSeq = 1;
@@ -341,17 +342,24 @@ export function createAcknowledgedInput(ports: {
   let incompleteHumanInput = false;
   let binding: { slot: number; generation: number; actorNonce: string } | null = null;
   let blocked = false;
-  const updateState = (value: RetainedInputState) => { state = value; ports.state(value); };
+  const updateState = (value: RetainedInputState) => {
+    state = value;
+    try {ports.state(value);} catch { /* Presentation cannot interrupt input bookkeeping. */ }
+  };
+  const markTrackedUncertain = () => {
+    if (sent && pending[0]?.tracked) pending[0].unsafeTracked = true;
+  };
   const settleTracked = (frame: Pending | undefined, accepted: boolean) => {
     const callback = frame?.settled;
     if (frame) frame.settled = undefined;
-    callback?.(accepted);
+    try {callback?.(accepted);} catch { /* Caller failure cannot interrupt ACK bookkeeping. */ }
   };
   const size = () => pending.reduce((sum, frame) => sum + frame.data.length, 0);
   const transmit = () => {
     if (!active || state === "halted") return;
     const frame = pending[0];
     if (!frame) return;
+    if (frame.unsafeTracked) { updateState("uncertain"); return; }
     if (frame.reviewOnly) { updateState("review"); return; }
     const payload = new Uint8Array(4 + frame.data.length);
     new DataView(payload.buffer).setUint32(0, frame.seq);
@@ -359,8 +367,15 @@ export function createAcknowledgedInput(ports: {
     // A failed/uncertain socket send must never allow automatic retry.
     sent = true;
     updateState("sending");
+    if (!active || pending[0] !== frame || state !== "sending") return;
     try { frame.send(payload); }
-    catch { updateState("uncertain"); settleTracked(frame, false); }
+    catch {
+      if (pending[0] === frame) {
+        markTrackedUncertain();
+        updateState("uncertain");
+        settleTracked(frame, false);
+      }
+    }
   };
   const enqueue = (bytes: Uint8Array, complete: boolean, retainOnly: boolean,
     settled?: (accepted: boolean) => void, send = ports.send) => {
@@ -373,6 +388,7 @@ export function createAcknowledgedInput(ports: {
       const end = Math.min(bytes.length, offset + maxFrame);
       pending.push({ seq: nextSeq++, data: bytes.slice(offset, end),
         complete: complete && !reportOnly && end === bytes.length, reportOnly, reviewOnly: retainOnly,
+        tracked: settled !== undefined, unsafeTracked: false,
         settled: end === bytes.length ? settled : undefined, send });
     }
     completed = false;
@@ -387,12 +403,15 @@ export function createAcknowledgedInput(ports: {
     for (const frame of pending) if (!frame.reportOnly) text += decoder.decode(frame.data, {stream: true});
     return text + decoder.decode();
   };
+  const canRetry = () => active && !!pending.length && !pending[0]?.tracked &&
+    (state === "uncertain" || state === "review");
   return {
     get version() { return ports.version ?? 1; },
     get state() { return state; },
     get completed() { return completed; },
     get pendingBytes() { return size(); },
     get deliveryUncertain() { return sent; },
+    get canRetry() { return canRetry(); },
     get incompleteHumanInput() { return incompleteHumanInput; },
     get binding() { return binding && { ...binding }; },
     get blocked() { return blocked; },
@@ -423,6 +442,7 @@ export function createAcknowledgedInput(ports: {
             binding.actorNonce !== actorNonce))) {
         blocked = true;
         active = false;
+        markTrackedUncertain();
         settleTracked(pending[0], false);
         updateState(pending.length ? (sent ? "uncertain" : "review") : "halted");
         return false;
@@ -436,11 +456,13 @@ export function createAcknowledgedInput(ports: {
       if (ports.version !== 2) return;
       blocked = true;
       active = false;
+      markTrackedUncertain();
       settleTracked(pending[0], false);
       updateState(pending.length ? (sent ? "uncertain" : "review") : "halted");
     },
     disconnect() {
       active = false;
+      markTrackedUncertain();
       settleTracked(pending[0], false);
       if (pending.length && state !== "halted" && !blocked)
         updateState(sent ? "uncertain" : "review");
@@ -456,57 +478,64 @@ export function createAcknowledgedInput(ports: {
     retain(bytes: Uint8Array, complete = false) { return enqueue(bytes, complete, true); },
     ack(created: number, id: string, seq: number, ok: boolean, reason?: string) {
       if (ports.version === 2 || !active || created !== ports.created || id !== ports.attachmentId ||
-          !Number.isSafeInteger(seq) || !sent ||
+          !Number.isSafeInteger(seq) || !sent || pending[0]?.unsafeTracked ||
           seq !== pending[0]?.seq || (state !== "sending" && state !== "uncertain")) {
+        markTrackedUncertain();
         if (pending.length && state !== "halted" && !blocked) updateState("uncertain");
         settleTracked(pending[0], false);
         return;
       }
       if (!ok) {
-        settleTracked(pending[0], false);
         if (reason === "switch_input_fenced" || reason === "input_pending") {
           sent = false;
           updateState("review");
-        } else updateState(reason === undefined ? "uncertain" : "halted");
+        } else {
+          markTrackedUncertain();
+          updateState(reason === undefined ? "uncertain" : "halted");
+        }
+        settleTracked(pending[0], false);
         return;
       }
       const accepted = pending.shift();
-      settleTracked(accepted, true);
       completed = accepted?.complete === true;
       if (accepted && !accepted.reportOnly)
         incompleteHumanInput = !accepted.complete;
       sent = false;
       if (pending.length) transmit();
       else updateState("ready");
+      settleTracked(accepted, true);
     },
     ackV2(created: number, slot: number, generation: number, seq: number, ok: boolean, reason?: string) {
       if (ports.version !== 2 || !active || !binding ||
           created !== ports.created || slot !== binding.slot || generation !== binding.generation ||
-          !Number.isSafeInteger(seq) || !sent || seq !== pending[0]?.seq ||
+          !Number.isSafeInteger(seq) || !sent || pending[0]?.unsafeTracked || seq !== pending[0]?.seq ||
           (state !== "sending" && state !== "uncertain")) {
+        markTrackedUncertain();
         if (pending.length && state !== "halted" && !blocked) updateState("uncertain");
         settleTracked(pending[0], false);
         return;
       }
       if (!ok) {
-        settleTracked(pending[0], false);
         if (reason === "switch_input_fenced" || reason === "input_pending") {
           sent = false;
           updateState("review");
-        } else updateState(reason === undefined ? "uncertain" : "halted");
+        } else {
+          markTrackedUncertain();
+          updateState(reason === undefined ? "uncertain" : "halted");
+        }
+        settleTracked(pending[0], false);
         return;
       }
       const accepted = pending.shift();
-      settleTracked(accepted, true);
       completed = accepted?.complete === true;
       if (accepted && !accepted.reportOnly) incompleteHumanInput = !accepted.complete;
       sent = false;
       if (pending.length) transmit();
       else updateState("ready");
+      settleTracked(accepted, true);
     },
     retry() {
-      if (!active || !pending.length || (state !== "uncertain" && state !== "review"))
-        return false;
+      if (!canRetry()) return false;
       for (const frame of pending) frame.reviewOnly = false;
       transmit();
       return true;
@@ -517,7 +546,6 @@ export function createAcknowledgedInput(ports: {
       const uncertain = sent;
       const halted = state === "halted";
       const first = head.seq;
-      settleTracked(head, false);
       pending.length = 0;
       sent = false;
       completed = false;
@@ -525,6 +553,7 @@ export function createAcknowledgedInput(ports: {
       // frame on this actor after uncertain delivery.
       if (uncertain || blocked || halted) updateState("halted");
       else { nextSeq = first; updateState(active ? "ready" : "review"); }
+      settleTracked(head, false);
       return true;
     },
   };

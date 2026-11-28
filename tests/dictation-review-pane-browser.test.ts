@@ -36,6 +36,30 @@ test('a detached uncertain retained actor is reviewable from another session', a
   }, false, 'en');
 });
 
+test('non-retryable ACK review offers only discard and does not acquire a lease', async () => {
+  await harness(async (page, _api, _sockets, writes) => {
+    await page.evaluate(() => {
+      const seen = {hold: 0, retry: 0};
+      (window as any).trackedReviewCalls = seen;
+      const lease = active.inputLease;
+      lease.hold = () => {seen.hold++;};
+      const input = {version: 2, binding: {}, state: 'uncertain', canRetry: false,
+        pendingBytes: 4, pendingHumanBytes: 4, retainedText: 'held', deliveryUncertain: true,
+        retry() {seen.retry++; return false;}};
+      active.inputAck = input;
+      active.inputAcks.set('A\0' + active.conn.created, {input, lease});
+      active.renderRetainedInput();
+    });
+    const review = page.locator('.pane.active .p-input-review');
+    assert.equal(await review.isVisible(), true);
+    assert.equal(await review.locator('.p-input-retry').isVisible(), false);
+    assert.equal(await review.locator('.p-input-discard').isVisible(), true);
+    await review.locator('.p-input-retry').evaluate((button: HTMLButtonElement) => button.click());
+    assert.deepEqual(await page.evaluate(() => (window as any).trackedReviewCalls), {hold: 0, retry: 0});
+    assert.deepEqual(wire(writes, 'A:0'), []);
+  }, false, 'en');
+});
+
 for (const delayed of [false, true]) test(`ordinary replay paste failure never writes Enter (${delayed ? 'after' : 'before'} the former Enter delay)`, async () => {
   await harness(async (page, _api, _sockets, writes) => {
     await open(page); await page.locator('#compose-text').fill('must not submit');
