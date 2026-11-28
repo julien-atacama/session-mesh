@@ -43,7 +43,8 @@ export type NativeFixture = {
   upstream: {pending: ServerResponse[]; calls: number};
 };
 
-export async function withNativeEditor(run: (f: NativeFixture) => Promise<void>, options: {touch?: boolean} = {}): Promise<void> {
+export async function withNativeEditor(run: (f: NativeFixture) => Promise<void>,
+  options: {touch?: boolean; upstreamPort?: number; onRouteDrainStart?: () => void} = {}): Promise<void> {
   assert.ok(chrome, 'MESH_CHROMIUM must be set when MESH_REQUIRE_BROWSER=1');
   assert.ok(process.env.MESH_PTYHOST_CMD, 'MESH_PTYHOST_CMD must select this tree\'s fresh native build explicitly');
   const argv = [process.env.MESH_PTYHOST_CMD];
@@ -59,7 +60,7 @@ export async function withNativeEditor(run: (f: NativeFixture) => Promise<void>,
       upstream.calls++; upstream.pending.push(res);
     } catch (error) {upstreamErrors.push(error); res.writeHead(500).end();}
   });
-  await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
+  let upstreamListening = false;
   let host: ChildProcess | undefined, browser: Browser | undefined;
   let drainRoutes: (() => Promise<void>) | undefined;
   let where: Awaited<ReturnType<typeof scratchHome>> | undefined;
@@ -67,6 +68,13 @@ export async function withNativeEditor(run: (f: NativeFixture) => Promise<void>,
   let socket = '', hostErrors = '';
   const name = 'native-editor';
   try {
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error): void => {http.off('listening', onListening); reject(error);};
+      const onListening = (): void => {http.off('error', onError); upstreamListening = true; resolve();};
+      http.once('error', onError);
+      http.once('listening', onListening);
+      http.listen(options.upstreamPort ?? 0, '127.0.0.1');
+    });
     where = await scratchHome('inline-native-', {
       SHELL: '/bin/sh', MESH_WHISPER_URL: `http://127.0.0.1:${(http.address() as {port: number}).port}/transcriptions`,
       MESH_NODE: process.execPath, MESH_PTYHOST_CMD: argv[0]!, PYTHONDONTWRITEBYTECODE: '1',
@@ -121,7 +129,10 @@ export async function withNativeEditor(run: (f: NativeFixture) => Promise<void>,
       document.addEventListener('securitypolicyviolation', event => root.__nativeCspViolation(event.effectiveDirective));
     });
     const page = await context.newPage(); page.setDefaultTimeout(7000); page.setDefaultNavigationTimeout(7000);
-    drainRoutes = () => page.isClosed() ? Promise.resolve() : page.unrouteAll({behavior: 'wait'});
+    drainRoutes = () => {
+      options.onRouteDrainStart?.();
+      return page.isClosed() ? Promise.resolve() : page.unrouteAll({behavior: 'wait'});
+    };
     page.on('pageerror', error => errors.push(error.message));
     // ONLY fixture identity substitution. No names/created/state/attachment or relay bytes are synthesized.
     await page.route('**/api/sessions*', async route => {
@@ -292,7 +303,10 @@ export async function withNativeEditor(run: (f: NativeFixture) => Promise<void>,
         catch {host.kill('SIGKILL'); await waitFor('private native host kill', 2000, () => host!.exitCode !== null || host!.signalCode !== null);}
       }
     });
-    await clean(async () => {http.closeAllConnections(); await new Promise<void>(resolve => http.close(() => resolve()));});
+    if (upstreamListening) await clean(async () => {
+      http.closeAllConnections();
+      await new Promise<void>((resolve, reject) => http.close(error => error ? reject(error) : resolve()));
+    });
     if (where) await clean(async () => removeScratch(where!.scratch));
     assert.deepEqual(cleanupErrors, [], 'all private native fixture resources cleaned up');
   }
@@ -363,8 +377,14 @@ export async function expectPaste(f: NativeFixture, text: string): Promise<void>
   assert.deepEqual(Buffer.concat(f.binary()), expected, 'actual browser binary frames contain exactly one framed paste and no automatic submit');
   assert.equal(f.snapshot().cursor, Array.from(text).length);
 }
-export function expectDirtyWithoutClean(f: NativeFixture): void {
-  const controls = f.sockets.flatMap(s => s.sent).filter(v => typeof v === 'string').map(v => JSON.parse(v));
+export function pasteSocket(f: NativeFixture): WireSocket {
+  const socket = f.sockets.findLast(s => s.sent.some(Buffer.isBuffer));
+  assert.ok(socket, 'observed the socket carrying the native paste');
+  return socket;
+}
+export function expectDirtyWithoutClean(f: NativeFixture, socket: WireSocket): void {
+  assert.ok(f.sockets.includes(socket), 'the paste socket belongs to this fixture');
+  const controls = socket.sent.filter(v => typeof v === 'string').map(v => JSON.parse(v));
   const h = controls.filter(c => c.t === 'h');
   assert.ok(h.some(c => c.dirty === true), 'own H becomes dirty');
   const first = h.findIndex(c => c.dirty === true);

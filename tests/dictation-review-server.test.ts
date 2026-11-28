@@ -97,6 +97,7 @@ for(const credential of ['cookie','master'] as const)test(`HTTP admission rechec
     const reply=c.events().find(event=>event.event==='held'&&event.path===route);
     assert.equal(reply?.status,200,'the held phase succeeded before generation changed');
     assert.equal(reply.next,mode==='preparation reply'?'commit':'done');
+    if(mode==='commit reply')await until(()=>f.upstreamCalls===1);
   }
   const generation=path.join(f.config,'cookie-generation');
   fs.writeFileSync(generation,String(Number(fs.readFileSync(generation,'utf8'))+1));

@@ -4,11 +4,12 @@
 // MESH_CHROMIUM: required by the real-browser/native fixture and discovered by browser shards.
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
+import {createServer} from 'node:http';
 import {promisify} from 'node:util';
 import {NativeEditorBuffer} from '../checks/dictation-native-editor.ts';
 import {
   nativeTest, withNativeEditor, record, expectBuffer, expectNoSubmission, expectPaste,
-  expectDirtyWithoutClean, manualKey, typeNative, waitRetired, waitMode,
+  expectDirtyWithoutClean, pasteSocket, manualKey, typeNative, waitRetired, waitMode,
 } from '../checks/dictation-inline-native-fixture.ts';
 declare const active: {term: {rows: number; cols: number}}, inlineDictation: any;
 
@@ -77,7 +78,8 @@ nativeTest('AC-3: native insertion and manual submission oracles', async () => {
     await expectPaste(f, 'alpha\nbeta\ttab'); expectNoSubmission(f);
     await waitRetired(f);
     assert.deepEqual(f.settlements.map(s => s.outcome), ['inserted'], 'real worker retirement is insertion, not submission');
-    expectDirtyWithoutClean(f);
+    const inputSocket = pasteSocket(f);
+    expectDirtyWithoutClean(f, inputSocket);
     await manualKey(f, 'Backspace'); await typeNative(f, 'B');
     await expectBuffer(f, 'alpha\nbeta\ttaB'); expectNoSubmission(f);
     await manualKey(f, 'Enter');
@@ -86,7 +88,7 @@ nativeTest('AC-3: native insertion and manual submission oracles', async () => {
     await expectBuffer(f, '');
     assert.equal(f.raw().toString(), '\x1b[200~alpha\rbeta\ttab\x1b[201~\x7fB\r');
     await f.wait('ordinary manual Enter emits clean H', () => {
-      const h = f.sockets.flatMap(s => s.sent).filter(value => typeof value === 'string')
+      const h = inputSocket.sent.filter(value => typeof value === 'string')
         .map(value => JSON.parse(value as string)).filter(value => value.t === 'h');
       return h.slice(h.findIndex(value => value.dirty === true) + 1).some(value => value.dirty === false);
     });
@@ -133,7 +135,7 @@ nativeTest('AC-10: record edit and manually submit native prompt', async () => {
       assert.equal(await f.page.locator('#line-direct').isVisible(), false);
     } else {
       await expectBuffer(f, 'bonjour A'); await expectPaste(f, 'bonjour A');
-      expectDirtyWithoutClean(f);
+      expectDirtyWithoutClean(f, pasteSocket(f));
     }
     expectNoSubmission(f); await waitRetired(f);
     assert.equal(await f.page.locator('dialog[open]').count(), 0, 'main-page capture never opens a modal');
@@ -231,10 +233,18 @@ for (const dirty of [false, true]) nativeTest(`ACK-v2 A→B→A retains the ${di
     }});
     await expectBuffer(f, dirty ? 'own late' : 'late');
     await waitRetired(f);
-    await f.wait('late original socket receipt', () => originalSocket.received.some(value =>
-      typeof value === 'string' && JSON.parse(value).t === 'input_ack'));
     const originalFrames = originalSocket.sent.filter(Buffer.isBuffer);
     assert.equal(originalFrames.length, originalFrameCount + 1, 'only the original socket carries the late insertion');
+    const seq = originalFrames[originalFrameCount]!.readUInt32BE(0);
+    const binding = await f.page.evaluate(() => (window as any).originalAck.input.binding);
+    assert.ok(binding, 'original actor remains bound for its late receipt');
+    await f.wait('late original socket receipt', () => originalSocket.received.some(value =>
+      typeof value === 'string' && (() => {
+        const receipt = JSON.parse(value);
+        return receipt.t === 'input_ack' && receipt.input_ack === true && receipt.seq === seq &&
+          receipt.created === f.created && receipt.slot === binding.slot &&
+          receipt.generation === binding.generation;
+      })()));
     const currentSocket = f.sockets.filter(s => new URL(s.url).pathname === '/ws/' + f.name).at(-1)!;
     assert.notEqual(currentSocket, originalSocket);
     assert.equal(currentSocket.sent.filter(Buffer.isBuffer).length, 0);
@@ -444,17 +454,17 @@ nativeTest('AC-11: native deletion and fresh dictation without Discard', async (
     const firstRequest = f.uploads[0]!.requestId;
     await manualKey(f, 'Backspace'); await expectBuffer(f, 'bonjour ');
     await manualKey(f, 'Control+u'); await expectBuffer(f, '');
-    expectNoSubmission(f); expectDirtyWithoutClean(f);
+    expectNoSubmission(f); expectDirtyWithoutClean(f, pasteSocket(f));
     await record(f, 'suite A'); await expectBuffer(f, 'suite A'); await waitRetired(f);
     assert.equal(f.uploads.length, 2); assert.notEqual(f.uploads[1]!.requestId, firstRequest);
-    expectDirtyWithoutClean(f); expectNoSubmission(f);
+    expectDirtyWithoutClean(f, pasteSocket(f)); expectNoSubmission(f);
     // Native text/cursor is a test-only private file, never a browser draft oracle.
     await manualKey(f, 'Control+u'); await typeNative(f, 'preexisting suffix');
     for (let i = 0; i < ' suffix'.length; i++) await manualKey(f, 'ArrowLeft');
     await record(f, '+spoken');
     await expectBuffer(f, 'preexisting+spoken suffix'); await waitRetired(f);
     assert.equal(f.snapshot().cursor, 'preexisting+spoken'.length);
-    expectDirtyWithoutClean(f); expectNoSubmission(f);
+    expectDirtyWithoutClean(f, pasteSocket(f)); expectNoSubmission(f);
     assert.equal(f.uploads.length, 3);
     assert.deepEqual(f.settlements.map(s => s.outcome), ['inserted', 'inserted', 'inserted']);
     assert.equal(await f.page.locator('dialog[open]').count(), 0);
@@ -467,10 +477,12 @@ nativeTest('AC-11: native deletion and fresh dictation without Discard', async (
 
 nativeTest('native fixture drains pending inventory routes before disposing the request context', async () => {
   let pending: Promise<void> | undefined, failure: unknown, completed = false;
+  let startDrain!: () => void;
+  const draining = new Promise<void>(resolve => {startDrain = resolve;});
   await withNativeEditor(async f => {
     await f.page.route('**/api/sessions?teardown=1', route => {
       pending = (async () => {
-        await new Promise(resolve => setTimeout(resolve, 200));
+        await draining;
         const response = await route.fetch();
         await route.fulfill({response}); completed = true;
       })().catch(error => {failure = error;});
@@ -479,7 +491,25 @@ nativeTest('native fixture drains pending inventory routes before disposing the 
     await f.page.evaluate(() => {void fetch('/api/sessions?teardown=1').catch(() => {});});
     await f.wait('inventory route is still active at fixture teardown', () => !!pending);
     assert.equal(completed, false);
-  });
+  }, {onRouteDrainStart: () => {
+    assert.ok(pending, 'route is pending when fixture teardown starts');
+    assert.equal(completed, false);
+    startDrain();
+  }});
   await pending;
   assert.equal(failure, undefined); assert.equal(completed, true);
+});
+
+nativeTest('native fixture rejects a failed upstream bind and leaves the existing listener intact', async () => {
+  const occupied = createServer();
+  await new Promise<void>(resolve => occupied.listen(0, '127.0.0.1', resolve));
+  try {
+    const port = (occupied.address() as {port: number}).port;
+    await assert.rejects(withNativeEditor(async () => {
+      assert.fail('fixture must fail before starting the native editor');
+    }, {upstreamPort: port}), {code: 'EADDRINUSE'});
+    assert.equal(occupied.listening, true);
+  } finally {
+    await new Promise<void>((resolve, reject) => occupied.close(error => error ? reject(error) : resolve()));
+  }
 });
