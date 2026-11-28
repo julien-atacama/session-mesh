@@ -1151,8 +1151,13 @@ class Pane {
     const pending = entries.reduce((total, entry) => total + entry.input.pendingBytes, 0);
     const current = this.inputAck;
     const obsolete = this.obsoleteDirtyInput();
+    // A retained socket's lease is reviewed on its own session, not by
+    // resizing an unrelated active terminal when its late ACK arrives.
     const other = [...this.inputAcks].filter(([key, entry]) =>
-      !key.startsWith(`${this.conn?.name ?? ""}\0`) && (entry.input.pendingBytes || entry.lease?.dirty));
+      (key.split("\0").length === 2 && !key.startsWith(`${this.conn?.name ?? ""}\0`) ||
+        (key.startsWith(`${this.conn?.name}\0${this.conn?.created}\0`) &&
+          !entry.input.retainedConnection && entry.lease?.dirty && !entry.input.pendingBytes)) &&
+      (entry.input.pendingBytes || entry.lease?.dirty));
     const saved = [...(this.recoveredLineDrafts || [])];
     const composeDraft = this.recoveredComposeDraft;
     const savedCompose = composeDraft && !this.recoveredComposeOwner &&
@@ -1279,7 +1284,9 @@ class Pane {
         // In-flight input does not need review. Showing it while another draft
         // keeps this panel open makes the terminal resize on every ACK.
         if (entry.input === current && entry.input.state === "sending") continue;
-        texts.push({ text: entry.input.retainedText, previous: key !== `${this.conn.name}\0${this.conn.created}` });
+        texts.push({ text: entry.input.retainedText, previous:
+          !key.startsWith(`${this.conn.name}\0${this.conn.created}\0`) &&
+          key !== `${this.conn.name}\0${this.conn.created}` });
       }
     }
     const existing = [...drafts.querySelectorAll("textarea")];
@@ -1332,7 +1339,7 @@ class Pane {
     if (!c) return null;
     const currentKey = `${c.name}\0${c.created}`;
     for (const [key, entry] of this.activeSessionInputs()) {
-      if (key !== currentKey && entry.input !== this.inputAck &&
+      if (key !== currentKey && !key.startsWith(`${currentKey}\0`) && entry.input !== this.inputAck &&
           !entry.input.pendingBytes && entry.lease?.dirty) return { key, entry };
     }
     return null;
@@ -1357,14 +1364,33 @@ class Pane {
       scope = MeshPaneActions.createHumanInputScope(() => {if (humanInputScopes.get(key) === scope) humanInputScopes.delete(key);});
       humanInputScopes.set(key, scope);
     }
+    const version = listedInputVersion(session);
+    if (version === 2 && !this.inputAcks.has(key)) {
+      const former = [...this.inputAcks].find(([old, entry]) =>
+        old.startsWith(`${key}\0`) && entry.input.version === 2 &&
+        !entry.input.retainedConnection && entry.retainedSocket &&
+        !entry.retainedSocket.isOpen() && !entry.input.pendingBytes);
+      if (former) {
+        const [old, entry] = former;
+        this.inputAcks.delete(old); this.inputLeases.delete(old);
+        this.inputAcks.set(key, entry); this.inputLeases.set(key, entry.lease);
+      }
+    }
     for (const [old, entry] of this.inputAcks) {
-      if (old !== key && entry.input.pendingBytes === 0 && !entry.lease?.dirty) {
-        this.inputAcks.delete(old);
-        this.inputLeases.delete(old);
+      if (old !== key && !entry.input.retainedConnection &&
+          entry.input.pendingBytes === 0 && !entry.lease?.dirty) {
+        this.inputAcks.delete(old); this.inputLeases.delete(old);
+      } else if (entry.input.retainedConnection && old.split("\0").length === 2) {
+        // The native host cannot bind one ACK actor to two simultaneous sockets.
+        // Keep this actor for its retained socket while a reopened pane gets its own.
+        const retained = `${old}\0${entry.id}`;
+        entry.retainedSocket = entry.input.retainedConnection.terminal;
+        this.inputAcks.delete(old); this.inputLeases.delete(old);
+        this.inputAcks.set(retained, entry); this.inputLeases.set(retained, entry.lease);
       }
     }
     let lease = this.inputLeases.get(key);
-    const version = listedInputVersion(session), previous = this.inputAcks.get(key);
+    const previous = this.inputAcks.get(key);
     if (lease && previous?.input.version === 1 && version === 2 &&
         !previous.input.pendingBytes && !lease.dirty &&
         ![...this.inputAcks.values()].some((entry) => entry.input.pendingBytes || entry.lease?.dirty)) {
@@ -2836,7 +2862,6 @@ class Pane {
       const current = (terminal) => !c.closed && this.conn === c && c.terminal === terminal;
       const version = this.inputAck?.version ?? 0;
       const socketInput = this.inputAck, socketLease = this.inputLease;
-      socketInput?.retainedConnection?.forgetRetainedInput?.();
       const knownBinding = version === 2 ? this.inputAck.binding : null;
       c.v2AwaitingCapability = version === 2;
       let openedThisAttempt = false;

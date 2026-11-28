@@ -10,7 +10,7 @@ import {
   nativeTest, withNativeEditor, record, expectBuffer, expectNoSubmission, expectPaste,
   expectDirtyWithoutClean, manualKey, typeNative, waitRetired, waitMode,
 } from '../checks/dictation-inline-native-fixture.ts';
-declare const active: {term: {rows: number; cols: number}};
+declare const active: {term: {rows: number; cols: number}}, inlineDictation: any;
 
 async function componentChecks(file: string, pattern: string, expected: number): Promise<void> {
   const env = {...process.env};
@@ -188,6 +188,137 @@ nativeTest('AC-10: record edit and manually submit native prompt', async () => {
     assert.equal(await f.page.evaluate(() => document.activeElement?.outerHTML ?? null), focus!);
     assert.deepEqual(await f.page.locator('.pane.active .xterm').boundingBox(), geometry);
     assert.equal(f.sockets.filter(s => new URL(s.url).pathname === '/ws/' + f.name).length, 1, 'released original uses no replacement socket');
+  });
+});
+
+for (const dirty of [false, true]) nativeTest(`ACK-v2 A→B→A retains the ${dirty ? 'own-dirty' : 'clean'} original actor and receipt`, async () => {
+  await withNativeEditor(async f => {
+    const b = await f.addEditor('native-B');
+    const originalSocket = f.sockets.find(s => new URL(s.url).pathname === '/ws/' + f.name);
+    assert.ok(originalSocket);
+    assert.ok(new URL(originalSocket.url).searchParams.has('input_ack'), 'the real attachment negotiated ACK input');
+    assert.ok(originalSocket.received.some(value => typeof value === 'string' &&
+      JSON.parse(value).t === 'input_capability' && JSON.parse(value).version === 2));
+    if (dirty) {await typeNative(f, 'own '); await expectBuffer(f, 'own ');}
+    const originalFrameCount = originalSocket.sent.filter(Buffer.isBuffer).length;
+    await f.page.evaluate(({name, created}) => {
+      const entry = active.inputAcks.get(`${name}\0${created}`);
+      (window as any).originalAck = {input: entry.input, lease: entry.lease, connection: active.conn};
+    }, {name: f.name, created: f.created});
+    await record(f, 'late', {beforeResult: async () => {
+      await f.select(b.name);
+      assert.equal(await f.page.evaluate(({name, created}) => {
+        const old = (window as any).originalAck;
+        const entry = [...active.inputAcks].find(([key, entry]) =>
+          key.startsWith(`${name}\0${created}\0`) && entry.input === old.input)?.[1];
+        return entry?.input === old.input && entry?.lease === old.lease;
+      }, {name: f.name, created: f.created}), true, 'switching to B preserves the retained original actor and lease');
+      await f.select(f.name);
+      assert.deepEqual(await f.page.evaluate(({name, created}) => {
+        const old = (window as any).originalAck;
+        const entry = active.inputAcks.get(`${name}\0${created}`);
+        const retained = [...active.inputAcks].find(([key, value]) =>
+          key.startsWith(`${name}\0${created}\0`) && value.input === old.input)?.[1];
+        return {input: retained?.input === old.input, lease: retained?.lease === old.lease,
+          freshActor: entry?.input === active.inputAck && entry?.input !== old.input,
+          originalRoute: old.input.retainedConnection === old.connection,
+          currentConnection: active.conn !== old.connection,
+          awaitingCapability: active.conn.v2AwaitingCapability};
+      }, {name: f.name, created: f.created}), {
+        input: true, lease: true, freshActor: true, originalRoute: true,
+        currentConnection: true, awaitingCapability: false,
+      }, 'returning to A must retain the old actor alongside a separately bound new socket');
+    }});
+    await expectBuffer(f, dirty ? 'own late' : 'late');
+    await waitRetired(f);
+    await f.wait('late original socket receipt', () => originalSocket.received.some(value =>
+      typeof value === 'string' && JSON.parse(value).t === 'input_ack'));
+    const originalFrames = originalSocket.sent.filter(Buffer.isBuffer);
+    assert.equal(originalFrames.length, originalFrameCount + 1, 'only the original socket carries the late insertion');
+    const currentSocket = f.sockets.filter(s => new URL(s.url).pathname === '/ws/' + f.name).at(-1)!;
+    assert.notEqual(currentSocket, originalSocket);
+    assert.equal(currentSocket.sent.filter(Buffer.isBuffer).length, 0);
+    expectNoSubmission(f);
+    assert.deepEqual(await f.page.evaluate(({name, created}) => {
+      const old = (window as any).originalAck;
+      const retained = [...active.inputAcks].find(([key, entry]) =>
+        key.startsWith(`${name}\0${created}\0`) && entry.input === old.input)?.[1];
+      return {dirty: retained?.lease.dirty, retained: !!retained,
+        reason: inlineDictation.reason(inlineDictation.session(name, created))};
+    }, {name: f.name, created: f.created}), {
+      dirty: true, retained: true, reason: 'ineligible',
+    }, 'the old dirty actor stays reviewable and fences a new A actor');
+    assert.equal(await f.page.locator('.pane.active .p-input-other-drafts .p-input-other-draft').count(), 1,
+      'same-incarnation old lease remains reachable from pane recovery');
+    await f.select(b.name);
+    const fresh = {...f, name: b.name, created: b.created, snapshot: b.snapshot, submissions: b.submissions};
+    await record(fresh, 'fresh'); await expectBuffer(fresh, 'fresh'); await waitRetired(fresh);
+    assert.equal(originalSocket.sent.filter(Buffer.isBuffer).length, originalFrameCount + 1, 'fresh capture cannot replay on the old socket');
+    assert.equal(currentSocket.sent.filter(Buffer.isBuffer).length, 0, 'fresh B capture cannot redirect to reopened A');
+    assert.equal(f.sockets.filter(s => new URL(s.url).pathname === '/ws/' + b.name)
+      .flatMap(s => s.sent.filter(Buffer.isBuffer)).length, 1, 'fresh B paste uses only B actor');
+    assert.deepEqual(b.submissions(), []);
+    await f.wait('released original socket', () => originalSocket.isClosed());
+    await f.select(f.name);
+    assert.equal(await f.page.evaluate(({name, created}) =>
+      active.inputAcks.get(`${name}\0${created}`)?.input === (window as any).originalAck.input &&
+      active.inputLease === (window as any).originalAck.lease, {name: f.name, created: f.created}), true,
+    'after original socket retirement the original dirty actor can resume on A');
+    await record(f, 'again'); await expectBuffer(f, dirty ? 'own lateagain' : 'lateagain'); await waitRetired(f);
+    assert.equal(originalSocket.sent.filter(Buffer.isBuffer).length, originalFrameCount + 1,
+      'a new A capture cannot replay on the old socket');
+    expectNoSubmission(f);
+  });
+});
+
+nativeTest('ACK-v2 intentional retirement of retained A rejects the late line without a fallback', async () => {
+  await withNativeEditor(async f => {
+    const b = await f.addEditor('native-B');
+    const original = f.sockets.find(s => new URL(s.url).pathname === `/ws/${f.name}`)!;
+    await record(f, 'must not arrive', {beforeResult: async () => {
+      await f.select(b.name);
+      await f.page.evaluate(({name, created}) => {
+        const retained = [...active.inputAcks].find(([key, entry]) =>
+          key.startsWith(`${name}\0${created}\0`) && entry.input.retainedConnection)?.[1];
+        if (!retained) throw Error('missing retained actor');
+        retained.input.retainedConnection.terminal.dispose();
+      }, {name: f.name, created: f.created});
+      await f.wait('intentional socket retirement', () => original.isClosed());
+    }});
+    await waitRetired(f);
+    await expectBuffer(f, '');
+    assert.equal(original.sent.filter(Buffer.isBuffer).length, 0, 'no late bytes after retirement');
+    expectNoSubmission(f);
+    await f.select(f.name);
+    await record(f, 'fresh'); await expectBuffer(f, 'fresh'); await waitRetired(f);
+    assert.equal(original.sent.filter(Buffer.isBuffer).length, 0, 'fresh input never replays on retired socket');
+    expectNoSubmission(f);
+  });
+});
+
+nativeTest('ACK-v2 same-A reattachment keeps its retained original socket independently bound', async () => {
+  await withNativeEditor(async f => {
+    const original = f.sockets.find(s => new URL(s.url).pathname === `/ws/${f.name}`)!;
+    await f.page.evaluate(({name, created}) => {
+      (window as any).originalActor = active.inputAcks.get(`${name}\0${created}`).input;
+    }, {name: f.name, created: f.created});
+    await record(f, 'late', {beforeResult: async () => {
+      await f.page.evaluate(name => active.attach(name), f.name);
+      await f.page.waitForFunction(({name, created}) => active.conn?.terminal?.isBound(name, created) &&
+        !active.conn.v2AwaitingCapability, {name: f.name, created: f.created});
+      assert.equal(await f.page.evaluate(({name, created}) => {
+        const old = (window as any).originalActor;
+        return [...active.inputAcks].some(([key, entry]) =>
+          key.startsWith(`${name}\0${created}\0`) && entry.input === old) &&
+          active.inputAck !== old && !!old.retainedConnection;
+      }, {name: f.name, created: f.created}), true);
+    }});
+    await expectBuffer(f, 'late'); await waitRetired(f);
+    assert.equal(original.sent.filter(Buffer.isBuffer).length, 1, 'late receipt and input remain on original socket');
+    const replacement = f.sockets.filter(s => new URL(s.url).pathname === `/ws/${f.name}`).at(-1)!;
+    assert.notEqual(original, replacement);
+    assert.equal(replacement.sent.filter(Buffer.isBuffer).length, 0);
+    expectNoSubmission(f);
   });
 });
 
