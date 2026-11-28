@@ -5,6 +5,42 @@ import { test } from "node:test";
 import { createAcknowledgedInput, terminalReportsOnly } from "../static/pane-actions.ts";
 
 const bytes = (s: string) => new TextEncoder().encode(s);
+test('tracked dictation input settles only on exact native ACK and never uses a queued actor', () => {
+  const sent: Uint8Array[] = [], settled: boolean[] = [];
+  const input = createAcknowledgedInput({version: 2, created: 42, send: frame => sent.push(frame), state: () => {}});
+  assert.equal(input.writeTracked(bytes('dictated'), false, ok => settled.push(ok)), false);
+  assert.equal(input.connectV2(42, 1, 1, 'a'.repeat(32), true), true);
+  assert.equal(input.writeTracked(bytes('dictated'), false, ok => settled.push(ok)), true);
+  assert.equal(sent.length, 1); assert.deepEqual([...sent[0]!.subarray(4)], [...bytes('dictated')]);
+  assert.deepEqual(settled, []);
+  assert.equal(input.writeTracked(bytes('later'), false, ok => settled.push(ok)), false);
+  input.ackV2(42, 2, 1, 1, true);
+  assert.deepEqual(settled, [false], 'wrong actor receipt cannot confirm insertion');
+  input.ackV2(42, 1, 1, 1, true);
+  assert.deepEqual(settled, [false], 'late matching receipt cannot reverse uncertainty');
+  assert.equal(sent.length, 1);
+});
+test('tracked dictation input confirms exactly once on the matching ACK', () => {
+  const settled: boolean[] = [], input = createAcknowledgedInput({
+    version: 2, created: 42, send: () => {}, state: () => {}});
+  input.connectV2(42, 1, 1, 'b'.repeat(32), true);
+  assert.equal(input.writeTracked(bytes('draft'), false, ok => settled.push(ok)), true);
+  assert.deepEqual(settled, []);
+  input.ackV2(42, 1, 1, 1, true);
+  input.ackV2(42, 1, 1, 1, true);
+  assert.deepEqual(settled, [true]);
+});
+test('tracked dictation input aborts on lost original binding without automatic replay', () => {
+  const sent: Uint8Array[] = [], settled: boolean[] = [];
+  const input = createAcknowledgedInput({version: 2, created: 42, send: frame => sent.push(frame), state: () => {}});
+  input.connectV2(42, 1, 1, 'c'.repeat(32), true);
+  assert.equal(input.writeTracked(bytes('draft'), false, ok => settled.push(ok)), true);
+  input.disconnect();
+  assert.deepEqual(settled, [false]);
+  input.connectV2(42, 1, 1, 'c'.repeat(32), true);
+  assert.equal(sent.length, 1);
+  assert.equal(input.writeTracked(bytes('other'), false, ok => settled.push(ok)), false);
+});
 test('locally retained input never transmits on reconnect without an explicit retry', () => {
   const frames: Uint8Array[] = [];
   const input = createAcknowledgedInput({version: 2, created: 42, send: frame => frames.push(frame), state: () => {}});

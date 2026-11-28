@@ -70,7 +70,8 @@ export function assertOwnPendingInputGuards(): void {
 }
 test('inline input: own pending input and foreign lease guards', assertOwnPendingInputGuards);
 
-function channelFixture(options: {scope?: HumanInputScope; insertionOnly?: boolean; held?: boolean} = {}) {
+function channelFixture(options: {scope?: HumanInputScope; insertionOnly?: boolean; held?: boolean;
+  writeAcknowledged?: (bytes: Uint8Array, complete: boolean, settled: (accepted: boolean) => void) => boolean} = {}) {
   const f = input(options.scope), mode = {value: true, valid: true, bytes() {}, dispose() {this.valid = false;}};
   const callbacks: (() => void)[] = [], seeds: string[] = [];
   let listener = (_frame: string): void => {}, pasteCalls = 0, releases = 0, live = true;
@@ -84,11 +85,36 @@ function channelFixture(options: {scope?: HumanInputScope; insertionOnly?: boole
     view: 1, kind: 'mesh' as const, available: true, activeSensitive: false};
   const make = () => createDictationChannel({target, socket, lease: f.lease, encoder: () => encoder,
     valid: () => live, release: () => releases++, transport: f.transport, mode,
+    writeAcknowledged: options.writeAcknowledged,
     insertionOnly: options.insertionOnly ?? true});
   return {...f, mode, callbacks, seeds, make, emit: (frame: string) => listener(frame),
     setPaste: (callback: (text: string) => void) => {paste = callback;},
     close: () => {live = false;}, counts: () => ({pasteCalls, releases})};
 }
+test('inline channel waits for the original native ACK and never falls back to untracked input', () => {
+  for(const accepted of [true,false]) {
+    const frames: Uint8Array[] = [], results: string[] = [];
+    let ack: ((ok: boolean) => void) | undefined;
+    const f = channelFixture({writeAcknowledged: (bytes, complete, settled) => {
+      assert.equal(complete,false);frames.push(bytes);ack=settled;return true;
+    }});
+    const channel=f.make();assert.equal(channel.claim(),true);
+    channel.deliver('editable',result=>results.push(result.kind),()=>true);
+    assert.deepEqual(f.frames,[],'never send an untracked frame');
+    assert.equal(new TextDecoder().decode(frames[0]),'\x1b[200~editable\x1b[201~');
+    assert.deepEqual(results,[]);
+    ack!(accepted);ack!(!accepted);
+    assert.deepEqual(results,[accepted?'paste':'uncertain']);
+  }
+});
+test('a synchronous tracked-send failure is uncertain, never retried as plain input', () => {
+  const f=channelFixture({writeAcknowledged: (_bytes,_complete,settled) => {settled(false);return true;}});
+  const channel=f.make(), results:string[]=[];
+  assert.equal(channel.claim(),true);
+  channel.deliver('draft',result=>results.push(result.kind),()=>true);
+  assert.deepEqual(results,['uncertain']);
+  assert.deepEqual(f.frames,[]);
+});
 
 function reopenedInput() {
   const controls: [string, boolean][] = [], frames: string[] = [];

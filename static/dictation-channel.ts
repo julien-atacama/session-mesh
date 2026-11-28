@@ -22,6 +22,7 @@ interface OriginalChannelPorts {
   // Native prompt insertion only. The app must supply original-binding/replay
   // provenance through valid(); construction snapshots the input revision at hold.
   insertionOnly?: boolean;
+  writeAcknowledged?(bytes: Uint8Array, complete: boolean, settled: (accepted: boolean) => void): boolean;
 }
 interface Preparation {
   encoder: Encoder; mode(): boolean; valid(): boolean;
@@ -135,7 +136,26 @@ class NativeInsertionChannel implements DictationChannel {
     if (paste.stopped) {this.refuse(paste, paste.failure); return;}
     if (paste.offset !== paste.expected.length) {this.refuse(paste, 'incomplete'); return;}
     if (!this.allowed(paste)) {this.refuse(paste, 'guard'); return;}
-    this.finish(paste, 'paste', null);
+    if (!this.p.writeAcknowledged) {this.finish(paste, 'paste', null); return;}
+    const p = this.p, bytes = new TextEncoder().encode(paste.expected), revision = p.lease.revision;
+    let queued = false;
+    try {
+      this.native!.write(bytes, false, {
+        control: (id, dirty) => p.transport.control(id, dirty),
+        data: payload => {
+          if (this.released || !p.mode.valid || !p.mode.value || !p.valid() || !paste.guard() ||
+              !p.lease.canInsert() || p.lease.revision !== revision + 1) throw Error('insertion guard revoked');
+          paste.attempted = true;
+          queued = p.writeAcknowledged!(payload, false, accepted => {
+            if (this.released) return;
+            if (accepted) this.finish(paste, 'paste', null);
+            else this.refuse(paste, 'send');
+          });
+          if (!queued) {paste.attempted = false; throw Error('acknowledged input unavailable');}
+        },
+      });
+    } catch { /* A rejected write must never fall back to an unacknowledged send. */ }
+    if (!queued) this.refuse(paste, 'send');
   }
   private frame(paste: InsertionPaste, frame: string): void {
     if (paste.stopped || paste.settled) return;
@@ -144,6 +164,10 @@ class NativeInsertionChannel implements DictationChannel {
       paste.stopped = true; paste.failure = 'incomplete'; return;
     }
     const p = this.p, bytes = new TextEncoder().encode(frame), revision = p.lease.revision;
+    if (p.writeAcknowledged) {
+      paste.frames++; paste.wireBytes += bytes.byteLength; paste.offset += frame.length;
+      return;
+    }
     try {
       // A paste never completes H ownership, even for a frame containing only CR.
       const delivered = this.native!.write(bytes, false, {

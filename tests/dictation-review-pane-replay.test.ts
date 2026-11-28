@@ -371,6 +371,27 @@ for (const touch of [false, true]) test(`${touch ? 'phone' : 'native'} app chann
   assert.doesNotThrow(() => channel.release()); assert.doesNotThrow(() => channel.release());
   assert.deepEqual(f.counts, {target: 1, terminal: 1, lease: 1});
 });
+test('retained ACK dictation refuses a changed connection after A to B to A selection', () => {
+  const f = channelSetupFixture(false, ''), c = f.context.inlineContexts.get(f.session);
+  c.name = 'A'; c.created = 1;
+  const original = c.connection, pane = c.pane;
+  original.name = 'A'; original.created = 1; original.terminal.isBound = () => true;
+  let writes = 0;
+  const input = {writeTracked: () => {writes++; return true;}};
+  pane.inputAck = input;
+  pane.inputAcks = new Map([['A\0' + 1, {input}]]);
+  f.context.MeshPaneActions.createDictationChannel = (ports: any) => ports;
+  const channel = f.context.retainInlineChannel(f.session);
+  const settled = () => {};
+  assert.equal(channel.writeAcknowledged(new Uint8Array([65]), false, settled), true);
+  pane.conn = {name:'B',created:1,terminal:original.terminal};
+  assert.equal(channel.writeAcknowledged(new Uint8Array([66]), false, settled), false);
+  pane.conn = {name:'A',created:1,terminal:original.terminal};
+  assert.equal(channel.writeAcknowledged(new Uint8Array([67]), false, settled), false,
+    'a reselected A actor is not the original connection');
+  assert.equal(writes,1);
+  channel.release();
+});
 test('inline header marks recording only after permission and recorder startup', () => {
   const attributes = new Map<string,string>(), button = {setAttribute(key: string,value: string) {attributes.set(key,value);}};
   const status = {id: 'native-status', dataset: {}}, session = {state: 'requesting'};

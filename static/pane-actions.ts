@@ -330,7 +330,8 @@ export function createAcknowledgedInput(ports: {
 }) {
   const maxPending = 1024 * 1024;
   const maxFrame = 65536;
-  type Pending = { seq: number; data: Uint8Array; complete: boolean; reportOnly: boolean; reviewOnly: boolean };
+  type Pending = { seq: number; data: Uint8Array; complete: boolean; reportOnly: boolean; reviewOnly: boolean;
+    settled: ((accepted: boolean) => void) | undefined };
   const pending: Pending[] = [];
   let nextSeq = 1;
   let active = false;
@@ -341,6 +342,11 @@ export function createAcknowledgedInput(ports: {
   let binding: { slot: number; generation: number; actorNonce: string } | null = null;
   let blocked = false;
   const updateState = (value: RetainedInputState) => { state = value; ports.state(value); };
+  const settleTracked = (frame: Pending | undefined, accepted: boolean) => {
+    const callback = frame?.settled;
+    if (frame) frame.settled = undefined;
+    callback?.(accepted);
+  };
   const size = () => pending.reduce((sum, frame) => sum + frame.data.length, 0);
   const transmit = () => {
     if (!active || state === "halted") return;
@@ -354,9 +360,10 @@ export function createAcknowledgedInput(ports: {
     sent = true;
     updateState("sending");
     try { ports.send(payload); }
-    catch { updateState("uncertain"); }
+    catch { updateState("uncertain"); settleTracked(frame, false); }
   };
-  const enqueue = (bytes: Uint8Array, complete: boolean, retainOnly: boolean) => {
+  const enqueue = (bytes: Uint8Array, complete: boolean, retainOnly: boolean,
+    settled?: (accepted: boolean) => void) => {
     if ((!retainOnly && (blocked || state === "halted")) || !bytes.length || bytes.length > maxPending - size() ||
         nextSeq + Math.ceil(bytes.length / maxFrame) > 0x80000000) return false;
     const reportOnly = terminalReportsOnly(bytes);
@@ -365,7 +372,8 @@ export function createAcknowledgedInput(ports: {
     for (let offset = 0; offset < bytes.length; offset += maxFrame) {
       const end = Math.min(bytes.length, offset + maxFrame);
       pending.push({ seq: nextSeq++, data: bytes.slice(offset, end),
-        complete: complete && !reportOnly && end === bytes.length, reportOnly, reviewOnly: retainOnly });
+        complete: complete && !reportOnly && end === bytes.length, reportOnly, reviewOnly: retainOnly,
+        settled: end === bytes.length ? settled : undefined });
     }
     completed = false;
     if (retainOnly) updateState(blocked || state === "halted" ? "halted" : sent ? "uncertain" : "review");
@@ -415,6 +423,7 @@ export function createAcknowledgedInput(ports: {
             binding.actorNonce !== actorNonce))) {
         blocked = true;
         active = false;
+        settleTracked(pending[0], false);
         updateState(pending.length ? (sent ? "uncertain" : "review") : "halted");
         return false;
       }
@@ -427,15 +436,21 @@ export function createAcknowledgedInput(ports: {
       if (ports.version !== 2) return;
       blocked = true;
       active = false;
+      settleTracked(pending[0], false);
       updateState(pending.length ? (sent ? "uncertain" : "review") : "halted");
     },
     disconnect() {
       active = false;
+      settleTracked(pending[0], false);
       if (pending.length && state !== "halted" && !blocked)
         updateState(sent ? "uncertain" : "review");
     },
     write(bytes: Uint8Array, complete = false) {
       return enqueue(bytes, complete, false);
+    },
+    writeTracked(bytes: Uint8Array, complete: boolean, settled: (accepted: boolean) => void) {
+      return active && state === "ready" && !blocked && !pending.length && bytes.length <= maxFrame &&
+        enqueue(bytes, complete, false, settled);
     },
     retain(bytes: Uint8Array, complete = false) { return enqueue(bytes, complete, true); },
     ack(created: number, id: string, seq: number, ok: boolean, reason?: string) {
@@ -443,9 +458,11 @@ export function createAcknowledgedInput(ports: {
           !Number.isSafeInteger(seq) || !sent ||
           seq !== pending[0]?.seq || (state !== "sending" && state !== "uncertain")) {
         if (pending.length && state !== "halted" && !blocked) updateState("uncertain");
+        settleTracked(pending[0], false);
         return;
       }
       if (!ok) {
+        settleTracked(pending[0], false);
         if (reason === "switch_input_fenced" || reason === "input_pending") {
           sent = false;
           updateState("review");
@@ -453,6 +470,7 @@ export function createAcknowledgedInput(ports: {
         return;
       }
       const accepted = pending.shift();
+      settleTracked(accepted, true);
       completed = accepted?.complete === true;
       if (accepted && !accepted.reportOnly)
         incompleteHumanInput = !accepted.complete;
@@ -466,9 +484,11 @@ export function createAcknowledgedInput(ports: {
           !Number.isSafeInteger(seq) || !sent || seq !== pending[0]?.seq ||
           (state !== "sending" && state !== "uncertain")) {
         if (pending.length && state !== "halted" && !blocked) updateState("uncertain");
+        settleTracked(pending[0], false);
         return;
       }
       if (!ok) {
+        settleTracked(pending[0], false);
         if (reason === "switch_input_fenced" || reason === "input_pending") {
           sent = false;
           updateState("review");
@@ -476,6 +496,7 @@ export function createAcknowledgedInput(ports: {
         return;
       }
       const accepted = pending.shift();
+      settleTracked(accepted, true);
       completed = accepted?.complete === true;
       if (accepted && !accepted.reportOnly) incompleteHumanInput = !accepted.complete;
       sent = false;
@@ -495,6 +516,7 @@ export function createAcknowledgedInput(ports: {
       const uncertain = sent;
       const halted = state === "halted";
       const first = head.seq;
+      settleTracked(head, false);
       pending.length = 0;
       sent = false;
       completed = false;

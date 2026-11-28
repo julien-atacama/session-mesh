@@ -191,7 +191,14 @@ export async function withNativeEditor(run: (f: NativeFixture) => Promise<void>,
       name, created, page, context, mesh, touch: options.touch === true, preferenceKey, sockets, uploads, settlements, upstream,
       snapshot, submissions: () => fs.readFileSync(path.join(oracle, 'submissions.jsonl'), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)),
       raw: () => fs.readFileSync(path.join(oracle, 'input.bin')),
-      binary: () => sockets.filter(ws => new URL(ws.url).pathname === '/ws/' + name).flatMap(ws => ws.sent.filter(Buffer.isBuffer)),
+      binary: () => sockets.filter(ws => new URL(ws.url).pathname === '/ws/' + name).flatMap(ws => {
+        const frames = ws.sent.filter(Buffer.isBuffer);
+        if (!new URL(ws.url).searchParams.has('input_ack')) return frames;
+        return frames.map(frame => {
+          assert.ok(frame.length > 4 && frame.readUInt32BE(0) > 0, 'acknowledged input has a sequence header');
+          return frame.subarray(4);
+        });
+      }),
       wireDiagnostics: () => allSockets.map(ws => ({id: ws.id, path: new URL(ws.url).pathname,
         created: new URL(ws.url).searchParams.get('created'), measured: sockets.includes(ws), closed: ws.isClosed(),
         closeObserved: ws.closedAt !== null, sentTypes: ws.sent.map(value => Buffer.isBuffer(value) ? 'binary:' + value.length : 'text'),

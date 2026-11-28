@@ -8319,6 +8319,9 @@ function retainInlineChannel(session) {
   const context = inlineContexts.get(session);
   if (!context || inlineContextReason(context, true)) return null;
   const {pane, connection, lease} = context, terminal = connection.terminal;
+  const inputAck = pane.inputAck;
+  if (inputAck && (pane.inputAcks.get(`${context.name}\0${context.created}`)?.input !== inputAck ||
+      pane.conn !== connection || pane.inputLease !== lease)) return null;
   const target = paneTargets.capture(pane);
   if (!target) return null;
   let releaseTerminal = null, released = false;
@@ -8337,6 +8340,11 @@ function retainInlineChannel(session) {
       valid: () => !inlineContextReason(context),
       release: releaseTarget,
       transport: {control: (id, dirty) => terminal.lease(id, dirty), data: bytes => terminal.queueInput(bytes)},
+      writeAcknowledged: inputAck ? (bytes, complete, settled) =>
+        pane.conn === connection && pane.inputAck === inputAck && pane.inputLease === lease &&
+        connection.terminal === terminal && !connection.v2AwaitingCapability &&
+        terminal.isBound(context.name, context.created) &&
+        inputAck.writeTracked(bytes, complete, settled) : undefined,
     });
   } catch (error) {releaseTarget(); throw error;}
 }
