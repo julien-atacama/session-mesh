@@ -30,10 +30,10 @@ async function componentChecks(file: string, pattern: string, expected: number):
 }
 
 nativeTest('AC-1: paste mode and control safety', async () => {
-  // Deterministic per-frame boundary checks use the shipped channel with a fake
-  // encoder. Native/browser assertions below remain separate and are not faked.
+  // Deterministic validation and write-boundary checks use the shipped
+  // channel. The native/browser assertions below remain separate.
   await componentChecks('tests/dictation-input-inline.test.ts',
-    '^inline channel: (disabled/invalid|late encoder|per-frame|reentrant H|native mode|pre-frame)', 6);
+    '^inline channel: (disabled/invalid|late encoder|encoder loss|reentrant H|native mode|pre-frame|complete encoder|real xterm)', 8);
   await withNativeEditor(async f => {
     await record(f, 'alpha\r\nbeta\ttab');
     await expectBuffer(f, 'alpha\nbeta\ttab');
