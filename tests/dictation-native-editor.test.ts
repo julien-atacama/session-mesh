@@ -29,3 +29,23 @@ test('controlled editor preserves preexisting text and edits only its native ins
   editor.feed(Buffer.from('\x15'));
   assert.equal(editor.text.join(''), ' suffix'); assert.equal(editor.cursor, 0);
 });
+
+test('controlled editor consumes only the exact cursor-position report without editing or submitting', () => {
+  const report = Buffer.from('\x1b[1;1R');
+  for (let split = 0; split <= report.length; split++) {
+    const submitted: Submission[] = [], editor = new NativeEditorBuffer(event => submitted.push(event));
+    editor.feed(Buffer.from('before'));
+    editor.feed(report.subarray(0, split));
+    editor.feed(report.subarray(split));
+    assert.equal(editor.text.join(''), 'before');
+    assert.equal(editor.cursor, 6);
+    assert.deepEqual(submitted, []);
+    editor.feed(Buffer.from('after'));
+    assert.equal(editor.text.join(''), 'beforeafter');
+    assert.deepEqual(submitted, []);
+  }
+  for (const unknown of ['\x1b[1;2R', '\x1b[2;1R', '\x1b[1;1X']) {
+    const editor = new NativeEditorBuffer(() => {});
+    assert.throws(() => editor.feed(Buffer.from(unknown)), /Unexpected native editor escape input/);
+  }
+});

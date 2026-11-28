@@ -287,37 +287,78 @@ for (const dirty of [false, true]) nativeTest(`ACK-v2 A→B→A retains the ${di
 
 nativeTest('ACK-v2 occupied terminal report refuses before H and settles its receipt', async () => {
   await withNativeEditor(async f => {
+    await f.settleInitialAttach(f.name);
+    await f.page.waitForFunction(() => active.inputAck?.state === 'ready' &&
+      active.inputAck.pendingBytes === 0);
     const socket = f.sockets.find(s => new URL(s.url).pathname === `/ws/${f.name}`)!;
-    const before = socket.sent.length;
+    const before = socket.sent.length, receivedBefore = socket.received.length;
+    const nativeBefore = f.snapshot(), rawBefore = f.raw().length;
     const result = await f.page.evaluate(({name, created}) => {
       const pane = active as any, session = inlineDictation.session(name, created);
+      const actor = pane.inputAck, ack = actor.ackV2.bind(actor);
+      const held: unknown[][] = [];
+      (window as any).reportActor = actor;
+      (window as any).reportConnection = pane.conn;
       inlineContexts.set(session, inlineContext(pane));
       const channel = retainInlineChannel(session);
       if (!channel?.claim()) throw Error('bound native channel did not claim');
       (window as any).heldChannel = channel;
-      const actor = pane.inputAck, original = actor.ackV2.bind(actor);
-      (window as any).heldReportAcks = [];
-      actor.ackV2 = (...args: unknown[]) => (window as any).heldReportAcks.push(args);
-      (window as any).releaseReportAcks = () => {
-        actor.ackV2 = original;
-        for (const args of (window as any).heldReportAcks.splice(0)) original(...args);
+      // Encoder setup is asynchronous. Hold the real callback until the
+      // insertion has observed a busy actor; never substitute a receipt.
+      actor.ackV2 = (...args: unknown[]) => {held.push(args);};
+      (window as any).heldReportAcks = held;
+      (window as any).releaseReportAck = () => {
+        actor.ackV2 = ack;
+        ack(...held.splice(0, 1)[0]!);
       };
-      if (!pane.inputAck.write(new TextEncoder().encode('\x1b[1;1R'))) throw Error('report did not enter actor');
+      if (!actor.write(new TextEncoder().encode('\x1b[1;1R'))) throw Error('report did not enter actor');
       (window as any).reportOutcome = '';
       channel.deliver('must not insert', (value: {kind: string}) => {(window as any).reportOutcome = value.kind;}, () => true);
-      return {state: pane.inputAck.state, dirty: pane.inputLease.dirty};
+      return {state: actor.state, dirty: pane.inputLease.dirty, binding: actor.binding};
     }, {name: f.name, created: f.created});
-    assert.deepEqual(result, {state: 'sending', dirty: false});
+    assert.equal(result.state, 'sending');
+    assert.equal(result.dirty, false);
+    assert.ok(result.binding, 'the report uses the native-bound original actor');
     await f.page.waitForFunction(() => (window as any).reportOutcome === 'refused' &&
       (window as any).heldReportAcks.length > 0);
-    assert.equal(await f.page.evaluate(() => active.inputLease.dirty), false);
-    await f.page.evaluate(() => (window as any).releaseReportAcks());
-    await f.page.waitForFunction(() => active.inputAck.state === 'ready' && active.inputAck.pendingBytes === 0);
+    await f.wait('report D observed on the original socket', () => socket.sent.slice(before).some(Buffer.isBuffer));
+    const reports = socket.sent.slice(before).filter(Buffer.isBuffer);
+    assert.equal(reports.length, 1, 'only the report sends D');
+    const seq = reports[0]!.readUInt32BE(0);
+    assert.ok(seq > 0, 'the report carries an ACK sequence');
+    assert.deepEqual(reports[0]!.subarray(4), Buffer.from('\x1b[1;1R'));
+    const reportReceipt = (value: string | Buffer) => {
+      if (typeof value !== 'string') return false;
+      const receipt = JSON.parse(value);
+      return receipt.t === 'input_ack' && receipt.input_ack === true && receipt.seq === seq &&
+        receipt.created === f.created && receipt.slot === result.binding.slot &&
+        receipt.generation === result.binding.generation;
+    };
+    await f.wait('exact native report receipt on the original socket', () =>
+      socket.received.slice(receivedBefore).some(reportReceipt));
+    assert.deepEqual(await f.page.evaluate(() => (window as any).heldReportAcks
+      .map((args: unknown[]) => args.slice(0, 5))),
+    [[f.created, result.binding.slot, result.binding.generation, seq, true]]);
+    await f.page.evaluate(() => (window as any).releaseReportAck());
+    assert.equal(socket.received.slice(receivedBefore).filter(value => typeof value === 'string' &&
+      JSON.parse(value).t === 'input_ack').length, 1, 'only the report is acknowledged after the baseline');
+    await f.page.waitForFunction(() => (window as any).reportActor.state === 'ready' &&
+      (window as any).reportActor.pendingBytes === 0);
+    await f.wait('controlled editor consumes the native report', () =>
+      f.snapshot().revision > nativeBefore.revision && f.raw().length >= rawBefore + Buffer.byteLength('\x1b[1;1R'));
+    assert.equal(f.snapshot().pid, nativeBefore.pid, 'the controlled editor stays alive after the report');
+    assert.equal(f.snapshot().text, nativeBefore.text, 'the report does not edit native text');
+    assert.equal(f.snapshot().cursor, nativeBefore.cursor, 'the report does not move the native cursor');
+    assert.deepEqual(f.raw().subarray(rawBefore), Buffer.from('\x1b[1;1R'),
+      'the controlled editor reads the exact native report');
+    assert.equal(await f.page.evaluate(() => active.inputAck === (window as any).reportActor &&
+      active.conn === (window as any).reportConnection), true, 'the original actor drains on its own connection');
+    assert.equal(f.sockets.filter(s => new URL(s.url).pathname === `/ws/${f.name}`).length, 1,
+      'the report does not reattach or reroute the editor');
     assert.equal(await f.page.evaluate(() => active.inputLease.dirty), false);
     assert.deepEqual(socket.sent.slice(before).filter(frame => typeof frame === 'string' &&
       JSON.parse(frame).t === 'h'), [], 'unavailable tracked insertion sends no H');
-    assert.deepEqual(socket.sent.slice(before).filter(Buffer.isBuffer).length, 1, 'only the report sends D');
-    assert.deepEqual(socket.sent.slice(before).filter(Buffer.isBuffer)[0]!.subarray(4), Buffer.from('\x1b[1;1R'));
+    assert.deepEqual(socket.sent.slice(before).filter(Buffer.isBuffer), reports, 'no other D follows the report');
     expectNoSubmission(f);
     await f.page.evaluate(() => (window as any).heldChannel.release());
     assert.equal(await f.page.evaluate(() => active.inputLease.dirty), false, 'release cannot create a reload hold');

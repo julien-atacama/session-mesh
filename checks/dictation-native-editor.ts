@@ -32,6 +32,7 @@ export class NativeEditorBuffer {
       '\x1b[A': () => {this.cursor = 0;}, '\x1b[B': () => {this.cursor = this.text.length;},
       '\x1b[H': () => {this.cursor = 0;}, '\x1b[F': () => {this.cursor = this.text.length;},
       '\x1b[3~': () => {this.text.splice(this.cursor, 1);},
+      '\x1b[1;1R': () => {}, // Exact test-owned terminal report; never an editable key.
     };
     while (this.pending) {
       if (this.paste) {
