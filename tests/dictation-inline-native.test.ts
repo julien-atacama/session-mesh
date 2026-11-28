@@ -310,6 +310,83 @@ nativeTest('ACK-v2 reconnects the retained dirty actor in place without replayin
   });
 });
 
+nativeTest('ACK-v2 reconnect leaves replay-deferred typing on the current socket', async () => {
+  await withNativeEditor(async f => {
+    const b = await f.addEditor('native-B');
+    const original = f.sockets.find(s => new URL(s.url).pathname === `/ws/${f.name}`)!;
+    await record(f, 'late', {beforeResult: async () => {
+      await f.select(b.name);
+      await f.select(f.name);
+    }});
+    await expectBuffer(f, 'late'); await waitRetired(f);
+    await f.wait('released original socket', () => original.isClosed());
+    await f.page.waitForFunction(() => !active.conn.v2AwaitingCapability && !!active.inputAck?.binding);
+    const queued = await f.page.evaluate(() => {
+      const c = active.conn;
+      (window as any).queuedReconnectConnection = c;
+      c.replayPending = true;
+      const retained = active.sendRaw(new TextEncoder().encode('kept'), false);
+      return {retained, length: c.queuedHumanInput?.length, dirty: active.inputLease.dirty,
+        pending: active.inputAck.pendingBytes};
+    });
+    assert.deepEqual(queued, {retained: true, length: 1, dirty: false, pending: 0});
+    await f.page.locator('.pane.active .p-input-other-drafts')
+      .getByRole('button', {name: 'Reconnect input', exact: true}).click();
+    assert.deepEqual(await f.page.evaluate(() => {
+      const c = (window as any).queuedReconnectConnection;
+      return {same: active.conn === c, length: c.queuedHumanInput?.length};
+    }), {same: true, length: 1}, 'reconnect refuses without discarding the deferred key');
+    await f.page.evaluate(() => {
+      active.conn.replayPending = false;
+      active.flushReplayInput(active.conn);
+    });
+    await expectBuffer(f, 'latekept');
+    expectNoSubmission(f);
+  });
+});
+
+nativeTest('ACK-v2 automatic rebind waits for the original socket to close', async () => {
+  await withNativeEditor(async f => {
+    const b = await f.addEditor('native-B');
+    const original = f.sockets.find(s => new URL(s.url).pathname === `/ws/${f.name}`)!;
+    await f.page.evaluate(() => {
+      const socket = active.conn.ws;
+      const close = socket.close.bind(socket);
+      (window as any).closingAck = active.inputAck;
+      // Delay the real handshake, while exposing the state seen during it.
+      socket.close = (...args: [number?, string?]) => {
+        Object.defineProperty(socket, 'readyState', {configurable: true, value: WebSocket.CLOSING});
+        (window as any).finishRetainedClose = () => {
+          Reflect.deleteProperty(socket, 'readyState');
+          socket.close = close;
+          close(...args);
+        };
+      };
+    });
+    try {
+      await record(f, 'late', {beforeResult: () => f.select(b.name)});
+      await expectBuffer(f, 'late'); await waitRetired(f);
+      await f.page.waitForFunction(() => !!(window as any).finishRetainedClose);
+      assert.equal(original.isClosed(), false, 'the original native socket is still connected');
+      const rebound = await f.page.evaluate(name => {
+        active.show(name); setActive(active);
+        return active.inputAck === (window as any).closingAck;
+      }, f.name);
+      assert.equal(rebound, false, 'a CLOSING socket must not lend its actor to a new attachment');
+    } finally {
+      await f.page.evaluate(() => (window as any).finishRetainedClose?.());
+    }
+    await f.wait('original socket closed', () => original.isClosed());
+    await f.select(f.name);
+    await f.select(b.name);
+    await f.select(f.name);
+    assert.equal(await f.page.evaluate(() => active.inputAck === (window as any).closingAck), true,
+      'the exact old actor is resumable after its socket closes');
+    await expectBuffer(f, 'late');
+    expectNoSubmission(f);
+  });
+});
+
 nativeTest('ACK-v2 intentional retirement of retained A rejects the late line without a fallback', async () => {
   await withNativeEditor(async f => {
     const b = await f.addEditor('native-B');

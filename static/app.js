@@ -602,6 +602,13 @@ function logObsoleteInput(name, created) {
   } catch { return false; }
 }
 
+function canRebindRetainedAck(entry) {
+  // A CLOSING socket can still hold the native actor.
+  return entry.input.version === 2 && !!entry.input.binding && !entry.input.blocked &&
+    !entry.input.pendingBytes && !entry.input.retainedConnection &&
+    entry.retainedSocket?.socket.readyState === WebSocket.CLOSED;
+}
+
 class Pane {
   constructor() {
     this.el = $("#pane-tpl").content.firstElementChild.cloneNode(true);
@@ -1353,12 +1360,12 @@ class Pane {
   reconnectRetainedInput(key, entry) {
     const c = this.conn, session = c && find(c.name);
     if (!localMeshEffectsAllowed() || !c || c.closed || c.ended || !session ||
-        !rowAuthoritative(session) || session.created !== c.created || listedInputVersion(session) !== 2) return false;
+        !rowAuthoritative(session) || session.created !== c.created || listedInputVersion(session) !== 2 ||
+        c.replaying || c.replayPending || c.draining || c.activeHumanInput || c.flushingHumanInput ||
+        c.cancellingHumanInput || c.queuedHumanInput?.length) return false;
     const currentKey = `${c.name}\0${c.created}`, current = this.inputAcks.get(currentKey);
     if (!key.startsWith(`${currentKey}\0`) || this.inputAcks.get(key) !== entry ||
-        entry.input.version !== 2 || !entry.input.binding || entry.input.blocked ||
-        entry.input.pendingBytes || !entry.lease?.dirty || entry.input.retainedConnection ||
-        entry.retainedSocket?.socket.readyState !== WebSocket.CLOSED ||
+        !entry.lease?.dirty || !canRebindRetainedAck(entry) ||
         !current || current.input !== this.inputAck || current.lease !== this.inputLease ||
         current.input.pendingBytes || current.input.retainedConnection || current.lease.dirty ||
         current.lease.releasePending || current.lease.retained) return false;
@@ -1394,9 +1401,7 @@ class Pane {
     const version = listedInputVersion(session);
     if (version === 2 && !this.inputAcks.has(key)) {
       const former = [...this.inputAcks].find(([old, entry]) =>
-        old.startsWith(`${key}\0`) && entry.input.version === 2 &&
-        !entry.input.retainedConnection && entry.retainedSocket &&
-        !entry.retainedSocket.isOpen() && !entry.input.pendingBytes);
+        old.startsWith(`${key}\0`) && canRebindRetainedAck(entry));
       if (former) {
         const [old, entry] = former;
         this.inputAcks.delete(old); this.inputLeases.delete(old);
