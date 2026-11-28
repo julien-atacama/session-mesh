@@ -246,6 +246,29 @@ test('a staged phone draft cannot submit to a replacement incarnation, but expli
   }, false, 'en', {rows:24, cols:80}, {hasTouch:true, isMobile:true, viewport:{width:390,height:844}});
 });
 
+test('pending phone dictation cannot adopt a replacement socket for the same session', async () => {
+  await harness(async (page, api, sockets, writes) => {
+    await mode(sockets, 'A'); await hold(page);
+    await waitFor('original phone recording admitted', 5000, () => api.jobs.length === 1);
+    await page.evaluate(() => {
+      (window as any).phoneOriginal = {connection: active.conn, terminal: active.conn.terminal};
+    });
+    sockets.get('A')![0]!.close({code: 1000, reason: 'fixture reconnect'});
+    await waitFor('replacement socket for the same A', 5000, () => sockets.get('A')?.length === 2);
+    sockets.get('A')![1]!.send(Buffer.from('\x1b[?2004h'));
+    await page.waitForFunction(() => {
+      const old = (window as any).phoneOriginal, c = active.conn;
+      return c === old.connection && c.terminal !== old.terminal && c.terminal.isBound('A', 1)
+        && !c.replaying && !c.replayPending && !c.draining && c.terminal.dictationMode.value;
+    });
+    await finish(page, api, 'A', 'must not become a replacement draft');
+    assert.equal(await page.locator('#line-text').inputValue(), '');
+    assert.equal(api.jobs[0]!.state, 'cancelled');
+    assert.deepEqual(payload(writes, 'A:0'), []);
+    assert.deepEqual(payload(writes, 'A:1'), []);
+  }, false, 'en', {rows:24, cols:80}, {hasTouch:true, isMobile:true, viewport:{width:390,height:844}});
+});
+
 test('phone dictation never overwrites intervening field edits, even when cleared again', async () => {
   for (const clearAgain of [false, true]) await harness(async (page, api, sockets, writes) => {
     await mode(sockets, 'A'); await hold(page);

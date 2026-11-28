@@ -1158,13 +1158,15 @@ class Pane {
     const pending = entries.reduce((total, entry) => total + entry.input.pendingBytes, 0);
     const current = this.inputAck;
     const obsolete = this.obsoleteDirtyInput();
-    // A retained socket's lease is reviewed on its own session, not by
-    // resizing an unrelated active terminal when its late ACK arrives.
-    const other = [...this.inputAcks].filter(([key, entry]) =>
-      (key.split("\0").length === 2 && !key.startsWith(`${this.conn?.name ?? ""}\0`) ||
-        (key.startsWith(`${this.conn?.name}\0${this.conn?.created}\0`) &&
-          !entry.input.retainedConnection && entry.lease?.dirty && !entry.input.pendingBytes)) &&
-      (entry.input.pendingBytes || entry.lease?.dirty));
+    const viewName = `${this.conn?.name ?? ""}\0`, viewActor = `${this.conn?.name}\0${this.conn?.created}\0`;
+    const other = [...this.inputAcks].filter(([key, entry]) => {
+      const foreign = !key.startsWith(viewName), pending = entry.input.pendingBytes;
+      if (key.split("\0").length === 2) return foreign && (pending || entry.lease?.dirty);
+      // Do not resize another terminal during a normal late ACK. Once the
+      // retained route is gone, outstanding input needs an explicit decision.
+      if (entry.input.retainedConnection) return false;
+      return foreign ? pending > 0 : key.startsWith(viewActor) && entry.lease?.dirty && !pending;
+    });
     const saved = [...(this.recoveredLineDrafts || [])];
     const composeDraft = this.recoveredComposeDraft;
     const savedCompose = composeDraft && !this.recoveredComposeOwner &&
@@ -8362,9 +8364,10 @@ function resolveInlineHold(button) {
 }
 function retainInlinePhonePrompt(context, releaseTarget) {
   const {pane, connection, lease} = context;
+  const terminal = connection.terminal;
   const fieldRevision = lineRevision, nativeRevision = lease.revision, releaseLease = lease.retain();
   let released = false, claimed = false, used = false;
-  const valid = () => !released && active === pane && pane.conn === connection
+  const valid = () => !released && active === pane && pane.conn === connection && connection.terminal === terminal
     && !pane.actionDisposed && !$("#line").hidden && !document.querySelector("dialog[open]")
     && lineRevision === fieldRevision && lease.revision === nativeRevision
     && !inlinePhoneBusy() && !inlineContextReason(context, true);
@@ -8382,7 +8385,7 @@ function retainInlinePhonePrompt(context, releaseTarget) {
       if (!claimed || used || !valid() || !guard()) {done({kind: "refused"}); return;}
       used = true;
       // Do not dispatch input: a dictated slash/skill must remain an editable draft too.
-      lineDictationOrigin = {...context, terminal: connection.terminal};
+      lineDictationOrigin = {...context, terminal};
       line.value = text; lineWasEmpty = false; lineRevision++; fitLine();
       done({kind: "draft"});
     },

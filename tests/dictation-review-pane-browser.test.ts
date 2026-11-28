@@ -7,6 +7,35 @@ declare const active: any, composeOwner: any, composeRecovery: any[], dictation:
 declare function refresh(): Promise<unknown>;
 declare function openSession(name: string): void;
 
+test('a detached uncertain retained actor is reviewable from another session', async () => {
+  await harness(async (page, _api, _sockets, writes) => {
+    await select(page, 'B');
+    await page.evaluate(() => {
+      const input = {pendingBytes: 4, pendingHumanBytes: 4, retainedText: 'held',
+        deliveryUncertain: false, retainedConnection: {},
+        discard() {this.pendingBytes = this.pendingHumanBytes = 0; this.retainedText = '';}};
+      (window as any).foreignRetainedInput = input;
+      active.inputAcks.set(['A', '1', 'old-actor'].join('\0'), {input, lease: {dirty: false}});
+      active.renderRetainedInput();
+    });
+    const other = page.locator('.pane.active .p-input-other-drafts .p-input-other-draft');
+    assert.equal(await other.count(), 0, 'a live detached delivery does not resize B');
+    await page.evaluate(() => {
+      const input = (window as any).foreignRetainedInput;
+      input.retainedConnection = null;
+      input.deliveryUncertain = true;
+      active.renderRetainedInput();
+    });
+    assert.equal(await other.count(), 1, 'a retired uncleared ACK must be reviewable without reopening A');
+    assert.equal(await other.locator('strong').textContent(), 'A');
+    assert.equal(await other.locator('textarea').inputValue(), 'held');
+    await other.getByRole('button', {name: /Discard/}).click();
+    assert.equal(await other.count(), 0);
+    assert.deepEqual(wire(writes, 'A:0'), []);
+    assert.deepEqual(wire(writes, 'B:0'), []);
+  }, false, 'en');
+});
+
 for (const delayed of [false, true]) test(`ordinary replay paste failure never writes Enter (${delayed ? 'after' : 'before'} the former Enter delay)`, async () => {
   await harness(async (page, _api, _sockets, writes) => {
     await open(page); await page.locator('#compose-text').fill('must not submit');
